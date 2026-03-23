@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartAI</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ═══════════════════════════════
+     TELA DE LOGIN
+═══════════════════════════════ -->
+<div class="screen active" id="loginScreen">
+  <div class="login-bg"></div>
+  <div class="login-grid"></div>
+
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="login-logo-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="brand-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback" style="display:none;">✦</span></div>
+      <div class="login-logo-text">SmartAI</div>
+    </div>
+
+    <div class="login-heading" id="authHeading">Bem-vindo de volta</div>
+    <div class="login-sub" id="authSub">Acesso interno — faça login para continuar</div>
+
+    <div class="tab-row">
+      <button class="tab-btn active" onclick="switchTab('login')">Entrar</button>
+      <button class="tab-btn" onclick="switchTab('signup')">Cadastrar</button>
+    </div>
+
+    <!-- Formulário de login -->
+    <div id="loginForm">
+      <div class="form-group">
+        <label class="form-label">E-mail</label>
+        <input type="email" class="form-input" id="loginEmail" placeholder="seu@empresa.com">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Senha</label>
+        <input type="password" class="form-input" id="loginPassword" placeholder="••••••••">
+      </div>
+      <button class="btn-primary" id="btnLogin" onclick="goToChat()">Entrar →</button>
+    </div>
+
+    <!-- Formulário de cadastro -->
+    <div id="signupForm" style="display: none;">
+      <div class="form-group">
+        <label class="form-label">Nome completo</label>
+        <input type="text" class="form-input" id="signupName" placeholder="João Silva">
+      </div>
+      <div class="form-group">
+        <label class="form-label">E-mail</label>
+        <input type="email" class="form-input" id="signupEmail" placeholder="seu@empresa.com">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Senha</label>
+        <input type="password" class="form-input" id="signupPassword" placeholder="Mínimo 8 caracteres">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Confirmar senha</label>
+        <input type="password" class="form-input" id="signupConfirm" placeholder="Repita a senha">
+      </div>
+      <button class="btn-primary" id="btnSignup" onclick="goToChat()">Criar conta →</button>
+    </div>
+
+    <div class="divider">ou</div>
+
+    <button class="btn-google" id="btnGoogle" onclick="goToChat()">
+      <svg width="18" height="18" viewBox="0 0 24 24">
+        <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+        <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+        <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" fill="#FBBC05"/>
+        <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+      </svg>
+      Continuar com Google
+    </button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════
+     TELA DE CHAT
+═══════════════════════════════ -->
+<div class="screen" id="chatScreen">
+
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+
+    <div class="sidebar-top">
+      <div class="brand">
+        <div class="brand-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="brand-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback" style="display:none;">✦</span></div>
+        <span class="brand-name">SmartAI</span>
+      </div>
+
+      <div class="search-bar" id="searchBar">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="8"/>
+          <path d="m21 21-4.35-4.35"/>
+        </svg>
+        <input type="text" id="searchInput" placeholder="Pesquisar conversas..." oninput="filterChats(this.value)">
+      </div>
+
+      <button class="btn-new-chat" id="btnNewChat" onclick="newChat()">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        Novo chat
+      </button>
+    </div>
+
+    <div class="sidebar-scroll" id="chatListScroll">
+      <!-- Back end injeta .chat-item's aqui dentro de #chatList -->
+      <div id="chatList">
+        <div class="sidebar-empty">
+          <div class="sidebar-empty-icon">💬</div>
+          <div class="sidebar-empty-text">Nenhuma conversa ainda.<br>Comece um novo chat.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="user-row" id="userRow" onclick="openProfile()">
+        <div class="avatar" id="sidebarAvatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="sidebarUserName">Usuário</div>
+          <div class="user-role" id="sidebarUserRole">Membro interno</div>
+        </div>
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path d="M9 18l6-6-6-6"/>
+        </svg>
+      </div>
+
+      <button class="footer-btn" id="btnTheme" onclick="openThemes()">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        Tema
+      </button>
+
+      <button class="footer-btn" id="btnLogout" onclick="logout()" style="color: var(--danger);">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+        </svg>
+        Sair
+      </button>
+    </div>
+  </div>
+
+  <!-- ÁREA PRINCIPAL -->
+  <div class="main-area">
+
+    <div class="top-bar">
+      <div class="top-actions">
+        <div class="icon-btn" id="btnThemeTop" onclick="openThemes()" title="Tema">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+          </svg>
+        </div>
+        <div class="icon-btn" id="btnProfileTop" onclick="openProfile()" title="Perfil">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M4 20c0-4 3.58-7 8-7s8 3 8 7"/>
+          </svg>
+        </div>
+        <div class="icon-btn" id="btnClearChat" onclick="clearChat()" title="Limpar chat">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14H6L5 6M10 11v6M14 11v6M9 6V4h6v2"/>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="messages-area" id="messagesArea">
+      <div class="welcome-state" id="welcomeState">
+        <div class="welcome-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="welcome-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback welcome-logo-fallback" style="display:none;">✦</span></div>
+        <div class="welcome-title">O que está em sua mente?</div>
+        <div class="welcome-sub">Digite uma mensagem ou anexe um arquivo para começar</div>
+      </div>
+      <div class="message-wrapper" id="messageList" style="display: none;"></div>
+    </div>
+
+    <div class="input-area">
+      <div class="file-preview-area" id="filePreview"></div>
+
+      <div class="input-box">
+        <textarea
+          id="chatInput"
+          placeholder="Mensagem para IA..."
+          rows="1"
+          onkeydown="handleKey(event)"
+          oninput="autoResize(this)"
+        ></textarea>
+        <div class="input-actions">
+          <button class="attach-btn" id="btnAttach" onclick="document.getElementById('fileInput').click()" title="Anexar arquivo">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <button class="send-btn" id="btnSend" onclick="sendMessage()">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+              <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="input-hint">Enter para enviar · Shift+Enter nova linha</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════
+     PANEL: TEMA
+═══════════════════════════════ -->
+<div class="panel-overlay" id="themePanel" onclick="closePanelOnOverlay(event, 'themePanel')">
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Aparência</div>
+      <button class="panel-close" onclick="closePanel('themePanel')">✕</button>
+    </div>
+    <div class="panel-body">
+      <div class="panel-section">
+        <div class="panel-section-label">Tema de cor</div>
+        <div class="theme-grid">
+          <div class="theme-option selected" onclick="applyTheme('')" id="theme-default">
+            <div class="theme-swatch swatch-default"></div>
+            Padrão
+          </div>
+          <div class="theme-option" onclick="applyTheme('midnight')" id="theme-midnight">
+            <div class="theme-swatch swatch-midnight"></div>
+            Meia-noite
+          </div>
+          <div class="theme-option" onclick="applyTheme('ocean')" id="theme-ocean">
+            <div class="theme-swatch swatch-ocean"></div>
+            Oceano
+          </div>
+          <div class="theme-option" onclick="applyTheme('forest')" id="theme-forest">
+            <div class="theme-swatch swatch-forest"></div>
+            Floresta
+          </div>
+          <div class="theme-option" onclick="applyTheme('rose')" id="theme-rose">
+            <div class="theme-swatch swatch-rose"></div>
+            Rosa
+          </div>
+          <div class="theme-option" onclick="applyTheme('light')" id="theme-light">
+            <div class="theme-swatch swatch-light"></div>
+            Claro
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════
+     PANEL: PERFIL
+═══════════════════════════════ -->
+<div class="panel-overlay" id="profilePanel" onclick="closePanelOnOverlay(event, 'profilePanel')">
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Perfil</div>
+      <button class="panel-close" onclick="closePanel('profilePanel')">✕</button>
+    </div>
+    <div class="panel-body">
+
+      <div class="panel-section" style="display: flex; align-items: center; gap: 16px;">
+        <div class="profile-avatar-big" id="bigAvatar">?</div>
+        <div>
+          <div class="profile-name-display" id="profileNameDisplay">Usuário</div>
+          <div class="profile-email-display" id="profileEmailDisplay">—</div>
+        </div>
+      </div>
+
+      <div class="panel-section">
+        <div class="panel-section-label">Alterar nome</div>
+        <input type="text" class="panel-input" id="inputNewName" placeholder="Novo nome">
+        <button class="btn-panel-primary" id="btnSaveName" onclick="saveName()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+            <path d="M20 6 9 17l-5-5"/>
+          </svg>
+          Salvar nome
+        </button>
+      </div>
+
+      <div class="panel-section">
+        <div class="panel-section-label">Alterar senha</div>
+        <input type="password" class="panel-input" id="inputCurrentPassword" placeholder="Senha atual">
+        <input type="password" class="panel-input" id="inputNewPassword" placeholder="Nova senha">
+        <input type="password" class="panel-input" id="inputConfirmPassword" placeholder="Confirmar nova senha">
+        <button class="btn-panel-primary" id="btnSavePassword" onclick="showToast('Senha atualizada!')">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+            <rect x="3" y="11" width="18" height="11" rx="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+          Atualizar senha
+        </button>
+      </div>
+
+      <div class="panel-section">
+        <div class="panel-section-label">Sessão</div>
+        <button class="btn-panel-danger" id="btnLogoutProfile" onclick="logout()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+          </svg>
+          Encerrar sessão
+        </button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Toast global -->
+<div class="toast" id="toast">
+  <span id="toastMsg">—</span>
+</div>
+
+<!-- Input de arquivo oculto -->
+<input type="file" id="fileInput" multiple onchange="handleFileAttach(event)">
+
+<script src="app.js"></script>
+</body>
+</html>
