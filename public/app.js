@@ -7,8 +7,20 @@ var chatList = [];
 var isTyping = false;
 var typingEl = null;
 var toastTimer;
+var MAX_ATTACHMENT_FILES = 3;
+var MAX_ATTACHMENT_TOTAL_BYTES = 4 * 1024 * 1024;
+var MAX_PROFILE_PHOTO_BYTES = 4 * 1024 * 1024;
 
 var AI_AVATAR_ASSET = 'logo-smart.png';
+
+function formatByteSize(bytes) {
+  var value = Number(bytes || 0);
+  if (value < 1024 * 1024) {
+    return Math.max(1, Math.round(value / 1024)) + 'KB';
+  }
+
+  return (value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + 'MB';
+}
 
 function getAiAvatarHtml(extraClass) {
   var cls = extraClass ? ' ' + extraClass : '';
@@ -389,6 +401,20 @@ async function sendMessage() {
   document.getElementById('messageList').style.display = 'block';
 
   var filesToSend = attachedFiles.slice();
+  var totalBytes = filesToSend.reduce(function (sum, file) {
+    return sum + Number(file && file.size ? file.size : 0);
+  }, 0);
+
+  if (filesToSend.length > MAX_ATTACHMENT_FILES) {
+    showToast('Envie no máximo ' + MAX_ATTACHMENT_FILES + ' arquivos por vez.');
+    return;
+  }
+
+  if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
+    showToast('O total de anexos por envio deve ficar em até ' + formatByteSize(MAX_ATTACHMENT_TOTAL_BYTES) + '.');
+    return;
+  }
+
   var localUserMessage = {
     id: null,
     role: 'user',
@@ -1102,7 +1128,21 @@ function addAttachedFiles(fileList) {
   var files = Array.from(fileList || []).filter(Boolean);
   if (!files.length) return;
 
-  attachedFiles = attachedFiles.concat(files);
+  var nextFiles = attachedFiles.concat(files);
+  if (nextFiles.length > MAX_ATTACHMENT_FILES) {
+    showToast('Envie no máximo ' + MAX_ATTACHMENT_FILES + ' arquivos por vez.');
+    return;
+  }
+
+  var totalBytes = nextFiles.reduce(function (sum, file) {
+    return sum + Number(file && file.size ? file.size : 0);
+  }, 0);
+  if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
+    showToast('O total de anexos por envio deve ficar em até ' + formatByteSize(MAX_ATTACHMENT_TOTAL_BYTES) + '.');
+    return;
+  }
+
+  attachedFiles = nextFiles;
   renderFilePreview();
 }
 
@@ -1313,6 +1353,11 @@ async function handleProfilePhoto(e) {
   var button = document.getElementById('btnUploadPhoto');
 
   if (!file) return;
+  if (file.size > MAX_PROFILE_PHOTO_BYTES) {
+    e.target.value = '';
+    showToast('A foto de perfil deve ter no máximo ' + formatByteSize(MAX_PROFILE_PHOTO_BYTES) + '.');
+    return;
+  }
 
   var form = new FormData();
   form.append('photo', file);

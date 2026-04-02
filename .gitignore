@@ -1,6 +1,7 @@
 # .gitignore
 .env
 .env.production
+.env.production.example
 node_modules/
 logs/
 storage/

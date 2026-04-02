@@ -1,5 +1,9 @@
 # Deploy de Produção
 
+Se a publicação for na Vercel, use primeiro [deploy/README_VERCEL.md](/home/davivieira/suporte_internoIA/deploy/README_VERCEL.md).
+
+O restante deste arquivo continua descrevendo o fluxo legado em Ubuntu com `systemd` + `nginx`.
+
 Este pacote assume Ubuntu 24.04+, Node 20+, Postgres local ou gerenciado e o app em `/opt/smartai/app`.
 
 ## 1. Preparar o servidor

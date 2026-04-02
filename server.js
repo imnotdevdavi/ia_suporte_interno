@@ -14,6 +14,23 @@ import mammoth from 'mammoth';
 import { createRequire } from 'module';
 import { createAsyncExpiringCache } from './lib/async-cache.js';
 import { pool, query, withTransaction } from './lib/db.js';
+import {
+  LOCAL_STORAGE_PROVIDER,
+  PRIVATE_BLOB_STORAGE_PROVIDER,
+  assertPersistentFileStorageConfigured,
+  buildBlobObjectPath,
+  deleteBlobObject,
+  getMaxAttachmentFiles,
+  getMaxAttachmentRequestBytes,
+  getMaxProfilePhotoBytes,
+  getMaxUploadBytes,
+  isBlobStoragePath,
+  isBlobStorageProvider,
+  isVercelRuntime,
+  shouldUseBlobStorage,
+  streamPrivateBlobToResponse,
+  uploadLocalFileToBlob,
+} from './lib/file-storage.js';
 import { createRateLimiter } from './lib/rate-limit.js';
 import {
   SESSION_COOKIE_NAME,
@@ -64,6 +81,12 @@ const execFileAsync = promisify(execFileCallback);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DEFAULT_LOG_DIR = path.join(__dirname, 'logs');
+const USE_BLOB_STORAGE = shouldUseBlobStorage();
+const USE_LOCAL_PERSISTENT_STORAGE = !USE_BLOB_STORAGE && !isVercelRuntime();
+const MAX_UPLOAD_FILE_SIZE = getMaxUploadBytes();
+const MAX_ATTACHMENT_FILES = getMaxAttachmentFiles();
+const MAX_ATTACHMENT_REQUEST_SIZE = getMaxAttachmentRequestBytes();
+const PROFILE_MAX_FILE_SIZE = getMaxProfilePhotoBytes();
 
 function resolveProjectPath(rawValue, fallbackPath) {
   const value = String(rawValue || '').trim();
@@ -102,8 +125,12 @@ function resolveTrustProxySetting(rawValue) {
   return value;
 }
 
-const LOG_FILE = resolveLogFilePath(process.env.SMARTAI_LOG_FILE);
-fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+const ENABLE_FILE_LOGGING = USE_LOCAL_PERSISTENT_STORAGE && Boolean(String(process.env.SMARTAI_LOG_FILE || '').trim());
+const LOG_FILE = ENABLE_FILE_LOGGING ? resolveLogFilePath(process.env.SMARTAI_LOG_FILE) : null;
+
+if (LOG_FILE) {
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+}
 
 const originalConsole = {
   log: console.log.bind(console),
@@ -111,7 +138,7 @@ const originalConsole = {
   error: console.error.bind(console),
   dir: console.dir.bind(console),
 };
-const logFileStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+const logFileStream = LOG_FILE ? fs.createWriteStream(LOG_FILE, { flags: 'a' }) : null;
 
 function writeLogEntry(level, args, inspectOptions = {}) {
   const rendered = args.map((arg) => {
@@ -127,7 +154,9 @@ function writeLogEntry(level, args, inspectOptions = {}) {
   }).join(' ');
 
   try {
-    logFileStream.write(`[${new Date().toISOString()}] [${level}] ${rendered}\n`);
+    if (logFileStream) {
+      logFileStream.write(`[${new Date().toISOString()}] [${level}] ${rendered}\n`);
+    }
   } catch {}
 }
 
@@ -187,17 +216,21 @@ const ATTACHMENT_STORAGE_DIR = path.join(STORAGE_DIR, 'attachments');
 const PROFILE_STORAGE_DIR = path.join(STORAGE_DIR, 'profiles');
 
 fs.mkdirSync(TEMP_UPLOAD_DIR, { recursive: true });
-fs.mkdirSync(ATTACHMENT_STORAGE_DIR, { recursive: true });
-fs.mkdirSync(PROFILE_STORAGE_DIR, { recursive: true });
+if (USE_LOCAL_PERSISTENT_STORAGE) {
+  fs.mkdirSync(ATTACHMENT_STORAGE_DIR, { recursive: true });
+  fs.mkdirSync(PROFILE_STORAGE_DIR, { recursive: true });
+}
 
 const upload = multer({
   dest: TEMP_UPLOAD_DIR,
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: {
+    fileSize: MAX_UPLOAD_FILE_SIZE,
+    files: MAX_ATTACHMENT_FILES,
+  },
 });
 
 const PROFILE_PHOTO_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const PROFILE_PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
-const PROFILE_MAX_FILE_SIZE = 5 * 1024 * 1024;
 const ALLOWED_THEMES = new Set(['default', 'midnight', 'ocean', 'forest', 'rose', 'light']);
 const GOOGLE_OAUTH_STATE_COOKIE_NAME = `${SESSION_COOKIE_NAME}_google_state`;
 const GOOGLE_OAUTH_STATE_DURATION_MS = 1000 * 60 * 10;
@@ -1539,6 +1572,46 @@ function makeSafeFileName(name = 'arquivo') {
   return value || 'arquivo';
 }
 
+function formatByteSize(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024 * 1024) {
+    return `${Math.max(1, Math.round(value / 1024))}KB`;
+  }
+
+  return `${(value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')}MB`;
+}
+
+function buildAttachmentContentDisposition(fileName = 'arquivo') {
+  const fallbackName = makeSafeFileName(fileName) || 'arquivo';
+  return `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(fileName || fallbackName)}`;
+}
+
+function getProfilePhotoStorageProvider(user) {
+  if (!user?.profile_photo_path) return '';
+  return isBlobStoragePath(user.profile_photo_path) ? PRIVATE_BLOB_STORAGE_PROVIDER : LOCAL_STORAGE_PROVIDER;
+}
+
+async function removeStoredFile(storagePath, storageProvider = '') {
+  if (!storagePath) return;
+
+  if (isBlobStorageProvider(storageProvider) || isBlobStoragePath(storagePath)) {
+    await deleteBlobObject(storagePath).catch(() => {});
+    return;
+  }
+
+  await safeUnlink(storagePath);
+}
+
+function assertAttachmentBatchWithinLimit(files = []) {
+  const totalBytes = files.reduce((sum, file) => sum + Number(file?.size || 0), 0);
+  if (totalBytes <= MAX_ATTACHMENT_REQUEST_SIZE) return;
+
+  throw Object.assign(
+    new Error(`Na Vercel, o total de anexos por envio deve ficar em até ${formatByteSize(MAX_ATTACHMENT_REQUEST_SIZE)}.`),
+    { statusCode: 413 }
+  );
+}
+
 function buildChatTitleFromInput(question, files = []) {
   const normalizedQuestion = normalizeQuery(question || '');
   if (normalizedQuestion) {
@@ -1565,6 +1638,35 @@ async function persistUploadedFileCopy(file, { userId, chatId, messageId }) {
   const extension = path.extname(originalName).toLowerCase();
   const baseName = path.basename(originalName, extension);
   const safeBaseName = makeSafeFileName(baseName);
+  const checksumSha256 = await sha256ForFile(file.path);
+
+  if (USE_BLOB_STORAGE) {
+    assertPersistentFileStorageConfigured();
+    const blob = await uploadLocalFileToBlob(file.path, {
+      objectPath: buildBlobObjectPath(
+        `attachments/user-${userId}/chat-${chatId}/message-${messageId}`,
+        `${safeBaseName}${extension}`
+      ),
+      contentType: file.mimetype,
+    });
+
+    return {
+      displayName: originalName,
+      originalName,
+      mimeType: file.mimetype,
+      fileExtension: extension || null,
+      byteSize: file.size || null,
+      checksumSha256,
+      storageProvider: PRIVATE_BLOB_STORAGE_PROVIDER,
+      storagePath: blob.url,
+      publicUrl: null,
+    };
+  }
+
+  if (!USE_LOCAL_PERSISTENT_STORAGE) {
+    throw Object.assign(new Error('Storage persistente não está disponível neste ambiente.'), { statusCode: 503 });
+  }
+
   const targetDir = path.join(
     ATTACHMENT_STORAGE_DIR,
     `user-${userId}`,
@@ -1585,8 +1687,10 @@ async function persistUploadedFileCopy(file, { userId, chatId, messageId }) {
     mimeType: file.mimetype,
     fileExtension: extension || null,
     byteSize: file.size || null,
-    checksumSha256: await sha256ForFile(targetPath),
+    checksumSha256,
+    storageProvider: LOCAL_STORAGE_PROVIDER,
     storagePath: targetPath,
+    publicUrl: null,
   };
 }
 
@@ -1621,9 +1725,9 @@ function buildAttachmentPersistencePayload(file, storedFile, extractedFile) {
     fileExtension: storedFile.fileExtension,
     byteSize: storedFile.byteSize,
     checksumSha256: storedFile.checksumSha256,
-    storageProvider: 'local',
+    storageProvider: storedFile.storageProvider || LOCAL_STORAGE_PROVIDER,
     storagePath: storedFile.storagePath,
-    publicUrl: null,
+    publicUrl: storedFile.publicUrl || null,
     extractedText,
     extractedMetadata,
   };
@@ -1638,7 +1742,26 @@ async function saveProfilePhotoFile(file, userId) {
   }
 
   if ((file.size || 0) > PROFILE_MAX_FILE_SIZE) {
-    throw Object.assign(new Error('A foto de perfil deve ter no máximo 5MB.'), { statusCode: 400 });
+    throw Object.assign(
+      new Error(`A foto de perfil deve ter no máximo ${formatByteSize(PROFILE_MAX_FILE_SIZE)}.`),
+      { statusCode: 400 }
+    );
+  }
+
+  if (USE_BLOB_STORAGE) {
+    assertPersistentFileStorageConfigured();
+    const blob = await uploadLocalFileToBlob(file.path, {
+      objectPath: buildBlobObjectPath(`profiles/user-${userId}`, `${makeSafeFileName(path.basename(originalName, extension))}${extension}`),
+      contentType: file.mimetype,
+    });
+    return {
+      storageProvider: PRIVATE_BLOB_STORAGE_PROVIDER,
+      storagePath: blob.url,
+    };
+  }
+
+  if (!USE_LOCAL_PERSISTENT_STORAGE) {
+    throw Object.assign(new Error('Storage persistente não está disponível neste ambiente.'), { statusCode: 503 });
   }
 
   const targetDir = path.join(PROFILE_STORAGE_DIR, `user-${userId}`);
@@ -1651,7 +1774,10 @@ async function saveProfilePhotoFile(file, userId) {
   );
 
   await fs.promises.copyFile(file.path, targetPath);
-  return targetPath;
+  return {
+    storageProvider: LOCAL_STORAGE_PROVIDER,
+    storagePath: targetPath,
+  };
 }
 
 async function issueSessionForUser(res, req, user, queryable) {
@@ -1941,14 +2067,15 @@ app.post('/api/profile/photo', requireAuth, upload.single('photo'), async (req, 
 
   try {
     const currentUser = await findUserById(req.auth.user.id);
-    const nextPhotoPath = await saveProfilePhotoFile(req.file, req.auth.user.id);
+    const nextPhoto = await saveProfilePhotoFile(req.file, req.auth.user.id);
     const user = await updateUserProfile({
       userId: req.auth.user.id,
-      profilePhotoPath: nextPhotoPath,
+      profilePhotoPath: nextPhoto.storagePath,
+      profilePhotoUrl: '',
     });
 
-    if (currentUser?.profile_photo_path && currentUser.profile_photo_path !== nextPhotoPath) {
-      safeUnlink(currentUser.profile_photo_path).catch(() => {});
+    if (currentUser?.profile_photo_path && currentUser.profile_photo_path !== nextPhoto.storagePath) {
+      removeStoredFile(currentUser.profile_photo_path, getProfilePhotoStorageProvider(currentUser)).catch(() => {});
     }
 
     return res.json({ user: serializeUser(user) });
@@ -1969,6 +2096,19 @@ app.get('/api/profile/photo', requireAuth, async (req, res) => {
   }
 
   try {
+    const storageProvider = getProfilePhotoStorageProvider(user);
+    if (isBlobStorageProvider(storageProvider)) {
+      const result = await streamPrivateBlobToResponse(res, user.profile_photo_path, {
+        ifNoneMatch: req.get('if-none-match') || '',
+      });
+
+      if (!result.found) {
+        return res.status(404).end();
+      }
+
+      return;
+    }
+
     await fs.promises.access(user.profile_photo_path, fs.constants.R_OK);
     return res.sendFile(user.profile_photo_path);
   } catch {
@@ -2036,8 +2176,29 @@ app.get('/api/attachments/:attachmentId', requireAuth, async (req, res) => {
 
   try {
     const attachment = await getAttachmentForUser(attachmentId, req.auth.user.id);
-    if (!attachment?.storage_path) {
+    if (!attachment?.storage_path && !attachment?.public_url) {
       return res.status(404).json({ error: 'Anexo não encontrado.' });
+    }
+
+    if (isBlobStorageProvider(attachment.storage_provider)) {
+      const result = await streamPrivateBlobToResponse(
+        res,
+        attachment.storage_path || attachment.public_url,
+        {
+          ifNoneMatch: req.get('if-none-match') || '',
+          contentDisposition: buildAttachmentContentDisposition(attachment.original_name),
+        }
+      );
+
+      if (!result.found) {
+        return res.status(404).json({ error: 'Anexo não encontrado.' });
+      }
+
+      return;
+    }
+
+    if (attachment.public_url && !attachment.storage_path) {
+      return res.redirect(302, attachment.public_url);
     }
 
     await fs.promises.access(attachment.storage_path, fs.constants.R_OK);
@@ -2309,6 +2470,12 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
   }
 
   const files = req.files || [];
+  try {
+    assertAttachmentBatchWithinLimit(files);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ error: error.message });
+  }
+
   if (!question && files.length === 0) {
     return res.status(400).json({ error: 'Envie uma pergunta ou arquivo.' });
   }
@@ -2670,32 +2837,65 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
   } catch (err) {
     console.error(`[SmartAI][${requestId}] Erro ao processar requisicao:`, err);
     logStageMetrics(requestId, stageTimer.snapshot(), notionMetrics);
+    const errorMessage = err?.statusCode ? err.message : 'Erro interno ao processar a pergunta.';
 
     if (wantsStream && res.headersSent) {
       writeStreamEvent(res, {
         type: 'error',
-        error: 'Erro interno ao processar a pergunta.',
+        error: errorMessage,
       });
       return res.end();
     }
 
-    res.status(500).json({ error: 'Erro interno ao processar a pergunta.' });
+    res.status(err?.statusCode || 500).json({ error: errorMessage });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('');
-  console.log(`SmartAI rodando em http://localhost:${PORT}`);
-  console.log(`Log persistido em ${LOG_FILE}`);
-  console.log('Streaming de resposta: habilitado');
-  console.log('Debug detalhado no console: habilitado');
-  pool.query('select current_database() as db')
-    .then((result) => {
-      console.log(`Postgres conectado ao banco ${result.rows[0].db}`);
-    })
-    .catch((error) => {
-      console.error('Falha ao conectar no Postgres:', error);
-    });
-  console.log('');
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: `Cada arquivo deve ter no máximo ${formatByteSize(MAX_UPLOAD_FILE_SIZE)} neste ambiente.`,
+      });
+    }
+
+    return res.status(400).json({ error: 'Falha ao processar o upload enviado.' });
+  }
+
+  if (error?.statusCode && !res.headersSent) {
+    return res.status(error.statusCode).json({ error: error.message || 'Erro na requisição.' });
+  }
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  console.error('Erro não tratado na aplicação:', error);
+
+  if (req.path.startsWith('/api/')) {
+    return res.status(500).json({ error: 'Erro interno ao processar a requisição.' });
+  }
+
+  return res.status(500).send('Erro interno ao processar a requisição.');
 });
+
+export default app;
+
+if (!isVercelRuntime()) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log('');
+    console.log(`SmartAI rodando em http://localhost:${PORT}`);
+    console.log(LOG_FILE ? `Log persistido em ${LOG_FILE}` : 'Log em stdout/stderr');
+    console.log('Streaming de resposta: habilitado');
+    console.log('Debug detalhado no console: habilitado');
+    pool.query('select current_database() as db')
+      .then((result) => {
+        console.log(`Postgres conectado ao banco ${result.rows[0].db}`);
+      })
+      .catch((error) => {
+        console.error('Falha ao conectar no Postgres:', error);
+      });
+    console.log('');
+  });
+}
