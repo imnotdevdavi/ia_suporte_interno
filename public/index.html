@@ -40,7 +40,7 @@
         <label class="form-label">Senha</label>
         <input type="password" class="form-input" id="loginPassword" placeholder="••••••••">
       </div>
-      <button class="btn-primary" id="btnLogin" onclick="goToChat()">Entrar →</button>
+      <button class="btn-primary" id="btnLogin" onclick="submitLogin()">Entrar →</button>
     </div>
 
     <!-- Formulário de cadastro -->
@@ -61,12 +61,12 @@
         <label class="form-label">Confirmar senha</label>
         <input type="password" class="form-input" id="signupConfirm" placeholder="Repita a senha">
       </div>
-      <button class="btn-primary" id="btnSignup" onclick="goToChat()">Criar conta →</button>
+      <button class="btn-primary" id="btnSignup" onclick="submitSignup()">Criar conta →</button>
     </div>
 
     <div class="divider">ou</div>
 
-    <button class="btn-google" id="btnGoogle" onclick="goToChat()">
+    <button class="btn-google" id="btnGoogle" onclick="loginWithGoogle()">
       <svg width="18" height="18" viewBox="0 0 24 24">
         <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
         <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
@@ -75,6 +75,12 @@
       </svg>
       Continuar com Google
     </button>
+
+    <div class="login-legal">
+      <a href="/privacy" target="_blank" rel="noopener">Política de Privacidade</a>
+      <span>•</span>
+      <a href="/terms" target="_blank" rel="noopener">Termos de Uso</a>
+    </div>
   </div>
 </div>
 
@@ -164,7 +170,7 @@
             <path d="M4 20c0-4 3.58-7 8-7s8 3 8 7"/>
           </svg>
         </div>
-        <div class="icon-btn" id="btnClearChat" onclick="clearChat()" title="Limpar chat">
+        <div class="icon-btn" id="btnClearChat" onclick="clearChat()" title="Excluir chat atual">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
             <polyline points="3 6 5 6 21 6"/>
             <path d="M19 6l-1 14H6L5 6M10 11v6M14 11v6M9 6V4h6v2"/>
@@ -185,7 +191,7 @@
     <div class="input-area">
       <div class="file-preview-area" id="filePreview"></div>
 
-      <div class="input-box">
+      <div class="input-box" id="composerBox">
         <textarea
           id="chatInput"
           placeholder="Mensagem para IA..."
@@ -207,7 +213,7 @@
         </div>
       </div>
 
-      <div class="input-hint">Enter para enviar · Shift+Enter nova linha</div>
+      <div class="input-hint">Enter para enviar · Shift+Enter nova linha · Arraste arquivos aqui</div>
     </div>
   </div>
 </div>
@@ -275,6 +281,18 @@
       </div>
 
       <div class="panel-section">
+        <div class="panel-section-label">Foto de perfil</div>
+        <button class="btn-panel-primary" id="btnUploadPhoto" onclick="document.getElementById('profilePhotoInput').click()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+            <path d="M12 16V4M7 9l5-5 5 5"/>
+            <path d="M5 20h14"/>
+          </svg>
+          Enviar foto
+        </button>
+        <div class="panel-help">PNG, JPG ou WEBP até 5MB.</div>
+      </div>
+
+      <div class="panel-section">
         <div class="panel-section-label">Alterar nome</div>
         <input type="text" class="panel-input" id="inputNewName" placeholder="Novo nome">
         <button class="btn-panel-primary" id="btnSaveName" onclick="saveName()">
@@ -290,7 +308,7 @@
         <input type="password" class="panel-input" id="inputCurrentPassword" placeholder="Senha atual">
         <input type="password" class="panel-input" id="inputNewPassword" placeholder="Nova senha">
         <input type="password" class="panel-input" id="inputConfirmPassword" placeholder="Confirmar nova senha">
-        <button class="btn-panel-primary" id="btnSavePassword" onclick="showToast('Senha atualizada!')">
+        <button class="btn-panel-primary" id="btnSavePassword" onclick="savePassword()">
           <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
             <rect x="3" y="11" width="18" height="11" rx="2"/>
             <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
@@ -320,6 +338,7 @@
 
 <!-- Input de arquivo oculto -->
 <input type="file" id="fileInput" multiple onchange="handleFileAttach(event)">
+<input type="file" id="profilePhotoInput" accept="image/png,image/jpeg,image/webp" onchange="handleProfilePhoto(event)" style="display:none;">
 
 <script src="app.js"></script>
 </body>

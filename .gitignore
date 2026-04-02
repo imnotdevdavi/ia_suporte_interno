@@ -1,3 +1,7 @@
 # .gitignore
 .env
+.env.production
 node_modules/
+logs/
+storage/
+tools/ngrok/

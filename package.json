@@ -3,9 +3,16 @@
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "tunnel": "bash deploy/scripts/start_full_stack.sh",
+    "start:prod": "NODE_ENV=production node server.js",
+    "db:init": "psql -d smartai -f db/migrations/001_initial_schema.sql -f db/migrations/002_google_oauth_and_chat_delete.sql",
+    "db:migrate": "psql -v ON_ERROR_STOP=1 -d smartai -f db/migrations/001_initial_schema.sql -f db/migrations/002_google_oauth_and_chat_delete.sql"
   },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
@@ -15,6 +22,7 @@
     "mammoth": "^1.12.0",
     "multer": "^2.1.1",
     "openai": "^4.52.7",
-    "pdf-parse": "^2.4.5"
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.20.0"
   }
 }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Agendamento diário do backup do SmartAI
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+Unit=smartai-backup.service
+
+[Install]
+WantedBy=timers.target

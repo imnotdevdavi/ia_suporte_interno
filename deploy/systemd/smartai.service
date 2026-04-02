@@ -1,0 +1,19 @@
+[Unit]
+Description=SmartAI Node application
+After=network.target
+
+[Service]
+Type=simple
+User=smartai
+Group=smartai
+WorkingDirectory=/opt/smartai/app
+EnvironmentFile=/opt/smartai/app/.env.production
+ExecStartPre=/usr/bin/test -f /opt/smartai/app/.env.production
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/smartai/systemd.log
+StandardError=append:/var/log/smartai/systemd-error.log
+
+[Install]
+WantedBy=multi-user.target
