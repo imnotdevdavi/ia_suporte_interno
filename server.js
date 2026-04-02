@@ -11,7 +11,6 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import fs from 'fs';
 import mammoth from 'mammoth';
-import { createRequire } from 'module';
 import { createAsyncExpiringCache } from './lib/async-cache.js';
 import { pool, query, withTransaction } from './lib/db.js';
 import {
@@ -74,9 +73,8 @@ import {
   upsertKnowledgeFeedbackQueue,
   upsertMessageFeedback,
 } from './lib/repository.js';
-const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse');
 const execFileAsync = promisify(execFileCallback);
+let pdfParseLoader = null;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -1076,12 +1074,28 @@ function looksLikeMojibake(text = '') {
   return /Ã.|Â|ð|�/.test(text);
 }
 
+async function loadPdfParse() {
+  if (!pdfParseLoader) {
+    pdfParseLoader = import('pdf-parse')
+      .then((mod) => mod.default || mod)
+      .catch((error) => {
+        console.warn('pdf-parse indisponivel neste ambiente. PDFs texto podem falhar:', error?.message || error);
+        return null;
+      });
+  }
+
+  return pdfParseLoader;
+}
+
 async function extractPdfText(tmpPath) {
   try {
-    const buffer = await fs.promises.readFile(tmpPath);
-    const result = await pdfParse(buffer);
-    const parsedText = normalizeExtractedText(result.text, MAX_FILE_CHARS);
-    if (parsedText) return parsedText;
+    const pdfParse = await loadPdfParse();
+    if (pdfParse) {
+      const buffer = await fs.promises.readFile(tmpPath);
+      const result = await pdfParse(buffer);
+      const parsedText = normalizeExtractedText(result.text, MAX_FILE_CHARS);
+      if (parsedText) return parsedText;
+    }
   } catch {}
 
   try {
