@@ -3033,6 +3033,8 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
   let question;
   let history = [];
   let chatId = null;
+  let chat = null;
+  let userMessage = null;
   let notionMetrics = null;
   let uploadedAttachmentRefs = [];
   let files = req.files || [];
@@ -3064,8 +3066,6 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
     question = displayQuestion || '(sem texto - analise os arquivos anexados)';
 
     const requestedChatId = parsePositiveInt(chatId);
-    let chat = null;
-
     if (requestedChatId) {
       chat = await stageTimer.measure('loadChat', async () => (
         getChatForUser(requestedChatId, req.auth.user.id)
@@ -3091,7 +3091,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       ));
     }
 
-    const userMessage = await stageTimer.measure('saveUserMessage', async () => (
+    userMessage = await stageTimer.measure('saveUserMessage', async () => (
       createMessage({
         chatId: chat.id,
         authorUserId: req.auth.user.id,
@@ -3103,6 +3103,18 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
         },
       })
     ));
+
+    if (wantsStream) {
+      prepareStreamResponse(res);
+      writeStreamEvent(res, {
+        type: 'meta',
+        data: {
+          requestId,
+          chatId: chat.id,
+          userMessageId: userMessage.id,
+        },
+      });
+    }
 
     const storedFiles = files.length
       ? await stageTimer.measure('persistFiles', async () => (
@@ -3156,6 +3168,14 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       if (fileIssues.length) errorPayload.fileIssues = fileIssues;
       console.log(`[SmartAI][${requestId}] Anexos extraidos:`, buildFilesDebug(extracted));
       console.log(`[SmartAI][${requestId}] Nenhum anexo legivel foi extraido. Encerrando antes de consultar o modelo.`);
+      if (wantsStream && res.headersSent) {
+        writeStreamEvent(res, {
+          type: 'error',
+          error: errorPayload.error,
+          data: errorPayload,
+        });
+        return res.end();
+      }
       return res.status(422).json(errorPayload);
     }
 
@@ -3256,7 +3276,6 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
     });
 
     if (wantsStream) {
-      prepareStreamResponse(res);
       writeStreamEvent(res, {
         type: 'meta',
         data: {
@@ -3474,6 +3493,11 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       writeStreamEvent(res, {
         type: 'error',
         error: errorMessage,
+        data: {
+          requestId,
+          chatId: chat?.id || null,
+          userMessageId: userMessage?.id || null,
+        },
       });
       return res.end();
     }

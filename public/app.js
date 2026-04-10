@@ -317,8 +317,9 @@ function filterChats(query) {
   });
 }
 
-async function loadChats(preferredChatId) {
+async function loadChats(preferredChatId, options) {
   if (!currentUser) return;
+  options = options || {};
 
   try {
     var response = await fetch('/api/chats');
@@ -332,6 +333,11 @@ async function loadChats(preferredChatId) {
 
     if (preferredChatId) {
       await loadChat(preferredChatId);
+      return;
+    }
+
+    if (options.preserveCurrentView) {
+      highlightActiveChat();
       return;
     }
 
@@ -506,6 +512,66 @@ function syncHistoryFromMessages() {
     });
 }
 
+function isRequestConversationVisible(requestState) {
+  return !!requestState && currentMessages === requestState.messages;
+}
+
+function syncRequestMeta(requestState, payload) {
+  if (!requestState || !payload) return;
+
+  if (payload.chatId) {
+    requestState.chatId = payload.chatId;
+  }
+
+  if (payload.userMessageId) {
+    requestState.localUserMessage.id = payload.userMessageId;
+  }
+
+  if (!requestState.chatId) return;
+
+  if (isRequestConversationVisible(requestState)) {
+    currentChatId = requestState.chatId;
+    highlightActiveChat();
+  }
+
+  loadChats(null, { preserveCurrentView: true }).catch(function (error) {
+    console.error(error);
+  });
+}
+
+function ensureAssistantElementForRequest(requestState, data) {
+  if (!isRequestConversationVisible(requestState)) return null;
+
+  if (!requestState.aiEl) {
+    removeTyping();
+    requestState.aiEl = appendAssistantMessage({
+      text: '',
+      sources: (data && data.sources) || [],
+      unsupported: (data && data.unsupported) || [],
+      fileIssues: (data && data.fileIssues) || [],
+      animate: false,
+      messageId: null,
+      feedbackValue: null
+    });
+  }
+
+  return requestState.aiEl;
+}
+
+function appendRequestErrorMessage(requestState, message, data) {
+  if (!isRequestConversationVisible(requestState)) return;
+
+  appendAssistantMessage({
+    text: message,
+    sources: (data && data.sources) || [],
+    unsupported: (data && data.unsupported) || [],
+    fileIssues: (data && data.fileIssues) || [],
+    animate: true,
+    messageId: null,
+    feedbackValue: null
+  });
+}
+
 async function sendMessage() {
   var input = document.getElementById('chatInput');
   var rawText = input.value;
@@ -555,83 +621,83 @@ async function sendMessage() {
   renderFilePreview();
   showTyping();
 
-  var fetchOptions;
-  if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE !== 'blob_direct') {
-    var form = new FormData();
-    form.append('question', text || '');
-    if (currentChatId) form.append('chatId', String(currentChatId));
-    form.append('history', JSON.stringify(chatHistory.slice(-10)));
-    filesToSend.forEach(function (file) { form.append('files', file); });
-    fetchOptions = {
-      method: 'POST',
-      headers: {
-        Accept: 'application/x-ndjson',
-        'X-Response-Mode': 'stream'
-      },
-      body: form
-    };
-  } else {
-    var uploadedAttachments = [];
-
-    if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE === 'blob_direct') {
-      uploadedAttachments = await uploadAttachmentFilesDirect(filesToSend);
-    }
-
-    fetchOptions = {
-      method: 'POST',
-      headers: {
-        Accept: 'application/x-ndjson',
-        'Content-Type': 'application/json',
-        'X-Response-Mode': 'stream'
-      },
-      body: JSON.stringify({
-        question: text,
-        chatId: currentChatId,
-        history: chatHistory.slice(-10),
-        attachments: uploadedAttachments
-      })
-    };
-  }
+  var requestState = {
+    messages: currentMessages,
+    localUserMessage: localUserMessage,
+    chatId: currentChatId,
+    aiEl: null,
+    answer: '',
+    meta: null
+  };
 
   try {
+    var fetchOptions;
+
+    if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE !== 'blob_direct') {
+      var form = new FormData();
+      form.append('question', text || '');
+      if (currentChatId) form.append('chatId', String(currentChatId));
+      form.append('history', JSON.stringify(chatHistory.slice(-10)));
+      filesToSend.forEach(function (file) { form.append('files', file); });
+      fetchOptions = {
+        method: 'POST',
+        headers: {
+          Accept: 'application/x-ndjson',
+          'X-Response-Mode': 'stream'
+        },
+        body: form
+      };
+    } else {
+      var uploadedAttachments = [];
+
+      if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE === 'blob_direct') {
+        uploadedAttachments = await uploadAttachmentFilesDirect(filesToSend);
+      }
+
+      fetchOptions = {
+        method: 'POST',
+        headers: {
+          Accept: 'application/x-ndjson',
+          'Content-Type': 'application/json',
+          'X-Response-Mode': 'stream'
+        },
+        body: JSON.stringify({
+          question: text,
+          chatId: currentChatId,
+          history: chatHistory.slice(-10),
+          attachments: uploadedAttachments
+        })
+      };
+    }
+
     var response = await fetch('/api/ask', fetchOptions);
 
     if (!response.ok) {
       var errorPayload = await safeReadJson(response);
-      if (errorPayload.chatId) {
-        currentChatId = errorPayload.chatId;
-        localUserMessage.id = errorPayload.userMessageId || null;
-        await loadChats(currentChatId);
-      }
-      throw new Error(errorPayload.error || 'Erro ao processar a pergunta.');
+      var requestError = new Error(errorPayload.error || 'Erro ao processar a pergunta.');
+      requestError.payload = errorPayload;
+      throw requestError;
     }
 
     var contentType = response.headers.get('content-type') || '';
     var data;
 
     if (contentType.indexOf('application/x-ndjson') > -1 && response.body) {
-      data = await consumeAssistantStream(response, localUserMessage);
+      data = await consumeAssistantStream(response, requestState);
     } else {
       data = await response.json();
-      removeTyping();
-      var assistantNode = appendAssistantMessage({
-        text: '',
-        sources: [],
-        unsupported: [],
-        fileIssues: [],
-        animate: false,
-        messageId: null,
-        feedbackValue: null
-      });
-      renderFinalAssistantMessage(assistantNode, data.answer || '', data);
+      syncRequestMeta(requestState, data);
+      var assistantNode = ensureAssistantElementForRequest(requestState, data);
+      if (assistantNode) {
+        renderFinalAssistantMessage(assistantNode, data.answer || '', data);
+      }
     }
 
     if (data.error) {
       return;
     }
 
-    currentChatId = data.chatId || currentChatId;
-    localUserMessage.id = data.userMessageId || localUserMessage.id;
+    syncRequestMeta(requestState, data);
 
     var assistantMessage = {
       id: data.assistantMessageId || null,
@@ -645,31 +711,37 @@ async function sendMessage() {
       feedbackValue: null
     };
 
-    currentMessages.push(assistantMessage);
-    syncHistoryFromMessages();
-    await loadChats(currentChatId);
+    requestState.messages.push(assistantMessage);
+
+    if (isRequestConversationVisible(requestState)) {
+      syncHistoryFromMessages();
+      await loadChats(requestState.chatId || currentChatId);
+    } else {
+      await loadChats(null, { preserveCurrentView: true });
+    }
   } catch (error) {
-    removeTyping();
-    appendAssistantMessage({
-      text: '⚠️ ' + (error.message || 'Erro de conexão.'),
-      sources: [],
-      unsupported: [],
-      fileIssues: [],
-      animate: true,
-      messageId: null,
-      feedbackValue: null
-    });
+    var errorPayload = error && error.payload ? error.payload : null;
+    if (errorPayload) {
+      syncRequestMeta(requestState, errorPayload);
+    }
+
+    var errorText = '⚠️ ' + ((errorPayload && errorPayload.error) || error.message || 'Erro de conexão.');
+    if (isRequestConversationVisible(requestState)) {
+      appendRequestErrorMessage(requestState, errorText, errorPayload);
+    } else {
+      showToast((errorPayload && errorPayload.error) || error.message || 'Erro de conexão.');
+    }
+
     console.error(error);
+  } finally {
+    removeTyping();
   }
 }
 
-async function consumeAssistantStream(response, localUserMessage) {
+async function consumeAssistantStream(response, requestState) {
   var reader = response.body.getReader();
   var decoder = new TextDecoder();
   var buffer = '';
-  var answer = '';
-  var meta = null;
-  var aiEl = null;
 
   while (true) {
     var result = await reader.read();
@@ -684,133 +756,72 @@ async function consumeAssistantStream(response, localUserMessage) {
       if (!line) continue;
 
       var event = JSON.parse(line);
-      var handled = handleStreamEvent(event, aiEl, answer, meta, localUserMessage);
-      aiEl = handled.aiEl;
-      answer = handled.answer;
-      meta = handled.meta;
-
+      var handled = handleStreamEvent(event, requestState);
       if (handled.done) return handled.data;
     }
   }
 
   if (buffer.trim()) {
     var finalEvent = JSON.parse(buffer.trim());
-    var finalHandled = handleStreamEvent(finalEvent, aiEl, answer, meta, localUserMessage);
+    var finalHandled = handleStreamEvent(finalEvent, requestState);
     if (finalHandled.done) return finalHandled.data;
-    aiEl = finalHandled.aiEl;
-    answer = finalHandled.answer;
-    meta = finalHandled.meta;
   }
 
-  if (!aiEl) {
-    removeTyping();
-    aiEl = appendAssistantMessage({
-      text: '',
-      sources: [],
-      unsupported: [],
-      fileIssues: [],
-      animate: false,
-      messageId: null,
-      feedbackValue: null
-    });
+  var fallbackData = Object.assign({}, requestState.meta || {});
+  fallbackData.answer = requestState.answer;
+  var fallbackAiEl = ensureAssistantElementForRequest(requestState, fallbackData);
+  if (fallbackAiEl) {
+    renderFinalAssistantMessage(fallbackAiEl, requestState.answer, fallbackData);
   }
-
-  var fallbackData = meta || {};
-  fallbackData.answer = answer;
-  renderFinalAssistantMessage(aiEl, answer, fallbackData);
   return fallbackData;
 }
 
-function handleStreamEvent(event, aiEl, answer, meta, localUserMessage) {
-  var nextAiEl = aiEl;
-  var nextAnswer = answer;
-  var nextMeta = meta;
-
+function handleStreamEvent(event, requestState) {
   if (event.type === 'meta') {
-    nextMeta = event.data || nextMeta;
-    currentChatId = nextMeta.chatId || currentChatId;
-    localUserMessage.id = nextMeta.userMessageId || localUserMessage.id;
-
-    if (!nextAiEl) {
-      removeTyping();
-      nextAiEl = appendAssistantMessage({
-        text: '',
-        sources: nextMeta.sources || [],
-        unsupported: nextMeta.unsupported || [],
-        fileIssues: nextMeta.fileIssues || [],
-        animate: false,
-        messageId: null,
-        feedbackValue: null
-      });
-      renderStreamingAssistantMessage(nextAiEl, nextAnswer);
-    }
+    requestState.meta = Object.assign({}, requestState.meta || {}, event.data || {});
+    syncRequestMeta(requestState, requestState.meta);
   }
 
   if (event.type === 'chunk') {
-    nextAnswer += event.delta || '';
-    if (!nextAiEl) {
-      removeTyping();
-      nextAiEl = appendAssistantMessage({
-        text: '',
-        sources: [],
-        unsupported: [],
-        fileIssues: [],
-        animate: false,
-        messageId: null,
-        feedbackValue: null
-      });
+    requestState.answer += event.delta || '';
+    var chunkAiEl = ensureAssistantElementForRequest(requestState, requestState.meta || {});
+    if (chunkAiEl) {
+      renderStreamingAssistantMessage(chunkAiEl, requestState.answer);
     }
-    renderStreamingAssistantMessage(nextAiEl, nextAnswer);
   }
 
   if (event.type === 'done') {
-    var data = event.data || {};
-    nextAnswer = data.answer || nextAnswer;
-    if (!nextAiEl) {
-      removeTyping();
-      nextAiEl = appendAssistantMessage({
-        text: '',
-        sources: [],
-        unsupported: [],
-        fileIssues: [],
-        animate: false,
-        messageId: null,
-        feedbackValue: null
-      });
+    var data = Object.assign({}, requestState.meta || {}, event.data || {});
+    requestState.meta = data;
+    syncRequestMeta(requestState, data);
+    requestState.answer = data.answer || requestState.answer;
+    var doneAiEl = ensureAssistantElementForRequest(requestState, data);
+    if (doneAiEl) {
+      renderFinalAssistantMessage(doneAiEl, requestState.answer, data);
     }
-    renderFinalAssistantMessage(nextAiEl, nextAnswer, data);
-    return { aiEl: nextAiEl, answer: nextAnswer, meta: data, done: true, data: data };
+    return { done: true, data: data };
   }
 
   if (event.type === 'error') {
-    var errorText = nextAnswer
-      ? nextAnswer + '\n\n⚠️ ' + (event.error || 'Erro ao processar a resposta.')
+    var errorData = Object.assign({}, requestState.meta || {}, event.data || {});
+    syncRequestMeta(requestState, errorData);
+    var errorText = requestState.answer
+      ? requestState.answer + '\n\n⚠️ ' + (event.error || 'Erro ao processar a resposta.')
       : '⚠️ ' + (event.error || 'Erro ao processar a resposta.');
-
-    if (!nextAiEl) {
-      removeTyping();
-      nextAiEl = appendAssistantMessage({
-        text: '',
-        sources: [],
-        unsupported: [],
-        fileIssues: [],
-        animate: false,
-        messageId: null,
-        feedbackValue: null
-      });
+    var errorAiEl = ensureAssistantElementForRequest(requestState, errorData);
+    if (errorAiEl) {
+      renderFinalAssistantMessage(errorAiEl, errorText, errorData);
     }
-
-    renderFinalAssistantMessage(nextAiEl, errorText, nextMeta || {});
     return {
-      aiEl: nextAiEl,
-      answer: nextAnswer,
-      meta: nextMeta,
       done: true,
-      data: { error: event.error || 'Erro ao processar a resposta.', answer: nextAnswer }
+      data: Object.assign({}, errorData, {
+        error: event.error || 'Erro ao processar a resposta.',
+        answer: requestState.answer
+      })
     };
   }
 
-  return { aiEl: nextAiEl, answer: nextAnswer, meta: nextMeta, done: false };
+  return { done: false };
 }
 
 function safeReadJson(response) {
