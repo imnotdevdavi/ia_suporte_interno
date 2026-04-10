@@ -295,8 +295,8 @@ const NOTION_SEARCH_CACHE_MAX_ENTRIES = 200;
 const NOTION_PAGE_CACHE_MAX_ENTRIES = 400;
 const MAX_SECTION_CHARS = 1800;
 const MAX_CONTEXT_PAGES = 3;
-const PRIMARY_PAGE_CONTEXT_CHARS = 5200;
-const SECONDARY_PAGE_CONTEXT_CHARS = 2800;
+const PRIMARY_PAGE_CONTEXT_CHARS = 6800;
+const SECONDARY_PAGE_CONTEXT_CHARS = 3200;
 const MAX_SNIPPETS_PER_PAGE = 4;
 const CONTEXT_SNIPPET_NEIGHBOR_WINDOW = 1;
 const MIN_RELEVANT_SCORE = 4;
@@ -936,6 +936,102 @@ function buildQuestionTerms(question) {
   )];
 }
 
+function extractDefinitionSubjectDisplay(question) {
+  const value = normalizeQuery(question || '');
+  if (!value) return '';
+
+  const patterns = [
+    /^o que é\s+/i,
+    /^o que e\s+/i,
+    /^oque é\s+/i,
+    /^oque e\s+/i,
+    /^qual é\s+/i,
+    /^qual e\s+/i,
+    /^qual seria\s+/i,
+    /^me explica o que é\s+/i,
+    /^me explica o que e\s+/i,
+    /^me explique o que é\s+/i,
+    /^me explique o que e\s+/i,
+  ];
+
+  for (const pattern of patterns) {
+    if (pattern.test(value)) {
+      return value.replace(pattern, '').trim();
+    }
+  }
+
+  return '';
+}
+
+function pageContainsNormalizedPhrase(page, normalizedPhrase) {
+  if (!normalizedPhrase) return false;
+
+  const haystacks = [
+    page?.title || '',
+    ...(page?.snippets || []).map((snippet) => `${snippet?.label || ''} ${snippet?.text || ''}`),
+  ];
+
+  return haystacks.some((value) => normalizeForMatch(value).includes(normalizedPhrase));
+}
+
+function buildClarificationCandidates(question, pages = []) {
+  const subjectDisplay = extractDefinitionSubjectDisplay(question);
+  const subject = normalizeForMatch(subjectDisplay);
+  const subjectTerms = buildQuestionTerms(subject);
+
+  if (!subject || subjectTerms.length < 2 || subjectTerms.length > 5) {
+    return { subjectDisplay, candidates: [] };
+  }
+
+  if (pages.some((page) => pageContainsNormalizedPhrase(page, subject))) {
+    return { subjectDisplay, candidates: [] };
+  }
+
+  const seen = new Set();
+  const candidates = pages
+    .map((page) => {
+      const title = String(page?.title || '').trim();
+      if (!title) return null;
+
+      const titleKey = normalizeForMatch(title);
+      if (!titleKey || seen.has(titleKey)) return null;
+      seen.add(titleKey);
+
+      const titleTerms = new Set(tokenizeForMatch(title));
+      const matchedTerms = subjectTerms.filter((term) => titleTerms.has(term));
+      if (!matchedTerms.length) return null;
+
+      return {
+        title,
+        score: matchedTerms.length * 10 + Number(page?.score || 0),
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 3);
+
+  return { subjectDisplay, candidates };
+}
+
+function buildClarificationAnswer(question, pages = []) {
+  const { subjectDisplay, candidates } = buildClarificationCandidates(question, pages);
+  if (!subjectDisplay || !candidates.length) return '';
+
+  const interpretationLine = candidates.length === 1
+    ? 'Para evitar uma resposta em cima do termo errado, a interpretação mais provável é:'
+    : 'Para evitar uma resposta em cima do termo errado, as interpretações mais prováveis são:';
+
+  return [
+    '## Entendimento',
+    `A expressão "${subjectDisplay}" não apareceu de forma exata na base interna.`,
+    interpretationLine,
+    ...candidates.map((candidate) => `- ${candidate.title}`),
+    '',
+    '## Confirmação',
+    'Me diga qual dessas opções você quis dizer, ou reformule o termo, que eu sigo com a orientação correta.',
+  ].join('\n');
+}
+
 function normalizeForMatch(text) {
   return (text || '')
     .normalize('NFD')
@@ -1058,7 +1154,25 @@ function selectPagesForContext(pages = []) {
     .slice(0, MAX_CONTEXT_PAGES);
 }
 
-function buildPageContextExcerpt(page, maxChars) {
+function shouldExpandSequentialContext(question, page, orderedSnippets = []) {
+  const normalizedQuestion = normalizeForMatch(question);
+  if (PROCESS_QUERY_TERMS.some((term) => normalizedQuestion.includes(term))) {
+    return true;
+  }
+
+  const normalizedTitle = normalizeForMatch(page?.title || '');
+  if (PROCESS_QUERY_TERMS.some((term) => normalizedTitle.includes(term))) {
+    return true;
+  }
+
+  return orderedSnippets.some((snippet) => {
+    const normalizedSnippet = normalizeForMatch(`${snippet?.label || ''} ${snippet?.text || ''}`);
+    return PROCESS_QUERY_TERMS.some((term) => normalizedSnippet.includes(term))
+      || /(^|\s)\d+(\s|$)/.test(normalizedSnippet);
+  });
+}
+
+function buildPageContextExcerpt(page, maxChars, question = '') {
   const sections = page.sections?.length
     ? page.sections
     : page.content
@@ -1070,16 +1184,28 @@ function buildPageContextExcerpt(page, maxChars) {
   const selectedIndexes = new Set();
   const orderedSnippets = [...(page.snippets || [])].sort((left, right) => right.score - left.score);
 
-  orderedSnippets.forEach((snippet) => {
-    if (!Number.isInteger(snippet.index)) return;
+  if (orderedSnippets.length && shouldExpandSequentialContext(question, page, orderedSnippets)) {
+    const firstSnippetIndex = orderedSnippets
+      .map((snippet) => snippet.index)
+      .filter(Number.isInteger)
+      .sort((left, right) => left - right)[0];
+    const startIndex = Math.max(0, (Number.isInteger(firstSnippetIndex) ? firstSnippetIndex : 0) - CONTEXT_SNIPPET_NEIGHBOR_WINDOW);
 
-    for (let offset = -CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset <= CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset += 1) {
-      const nextIndex = snippet.index + offset;
-      if (nextIndex >= 0 && nextIndex < sections.length) {
-        selectedIndexes.add(nextIndex);
-      }
+    for (let index = startIndex; index < sections.length; index += 1) {
+      selectedIndexes.add(index);
     }
-  });
+  } else {
+    orderedSnippets.forEach((snippet) => {
+      if (!Number.isInteger(snippet.index)) return;
+
+      for (let offset = -CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset <= CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset += 1) {
+        const nextIndex = snippet.index + offset;
+        if (nextIndex >= 0 && nextIndex < sections.length) {
+          selectedIndexes.add(nextIndex);
+        }
+      }
+    });
+  }
 
   if (!selectedIndexes.size) {
     selectedIndexes.add(0);
@@ -1116,14 +1242,14 @@ function buildPageContextExcerpt(page, maxChars) {
   return normalizeExtractedText(parts.join('\n\n'), maxChars);
 }
 
-function buildContextFromPages(pages) {
+function buildContextFromPages(pages, question = '') {
   const selectedPages = selectPagesForContext(pages);
   if (!selectedPages.length) return null;
 
   return selectedPages
     .map((page, index) => {
       const contextLimit = index === 0 ? PRIMARY_PAGE_CONTEXT_CHARS : SECONDARY_PAGE_CONTEXT_CHARS;
-      const excerpt = buildPageContextExcerpt(page, contextLimit);
+      const excerpt = buildPageContextExcerpt(page, contextLimit, question);
       const lines = [
         `Documento: ${page.title}`,
         `URL: ${page.url}`,
@@ -1188,6 +1314,15 @@ const KNOWN_BUSINESS_TERMS = new Set([
   'parceiro',
   'planilha',
 ]);
+const PROCESS_QUERY_TERMS = [
+  'como',
+  'etapa',
+  'fluxo',
+  'passo',
+  'procedimento',
+  'processo',
+  'roteiro',
+];
 
 /* ═══════════════════════════════════════════════
    EXTRAÇÃO DE ARQUIVOS
@@ -2573,6 +2708,26 @@ app.get('/api/profile/photo', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/chats', requireAuth, async (req, res) => {
+  const question = normalizeQuery(req.body?.question || '');
+  const attachmentNames = Array.isArray(req.body?.attachmentNames) ? req.body.attachmentNames : [];
+  const attachmentPlaceholders = attachmentNames
+    .map((name) => normalizeUploadedFileName(name))
+    .filter(Boolean)
+    .map((originalname) => ({ originalname }));
+
+  try {
+    const chat = await createChatThread({
+      ownerUserId: req.auth.user.id,
+      title: buildChatTitleFromInput(question, attachmentPlaceholders),
+    });
+
+    return res.status(201).json({ chat: serializeChat(chat) });
+  } catch {
+    return res.status(500).json({ error: 'Não foi possível criar o chat.' });
+  }
+});
+
 app.get('/api/chats', requireAuth, async (req, res) => {
   try {
     const chats = await listChatsForUser(req.auth.user.id);
@@ -2749,12 +2904,14 @@ REGRAS DE COMPORTAMENTO:
 - Nunca invente, suponha ou complete lacunas sem deixar claro o que veio do Notion, o que veio da Web e o que nao foi encontrado.
 - Sempre que citar uma informação, identifique o nome real da página/documento do Notion (ex: "conforme a página Política de Reembolso"). Nunca use rótulos como Doc 1, Doc 2 ou similares.
 - Se o usuario perguntar sobre um arquivo anexado e ele nao puder ser lido, diga claramente que nao foi possivel analisar o anexo. Nao responda como se o arquivo tivesse sido compreendido.
-- Se a mensagem enviada pelo usuário possuir algum erro de digitação, apresente sugestões baseadas em tópicos sobre o que ele poderia estar se referindo.
+- Se a mensagem enviada pelo usuário possuir algum erro de digitação, termo híbrido, nome pouco usual ou combinação potencialmente ambígua, nao assuma a resposta final de primeira. Diga em 2 ou 3 bullets o que voce acha que ele pode estar querendo dizer e peça confirmação antes do passo a passo.
 - Nao se recuse a atender apenas porque a pergunta veio com erro de digitação, sigla errada, abreviação incomum ou gramática ruim. Interprete o contexto, corrija mentalmente o que for preciso e siga ajudando.
 - Se a base interna nao trouxer a informação exata, diga isso explicitamente. Se houver fontes externas úteis, apresente-as como complemento e deixe claro que sao externas.
 - Se houver divergencia entre Notion e Web, destaque a divergencia com clareza, mantenha a regra interna como prioridade para procedimento da empresa e oriente o colaborador a contatar seu tutor, lider ou o setor responsável antes de executar.
 - Se o Notion nao tiver informação suficiente, mas a Web tiver contexto útil, monte um pequeno relatório comparando o que foi encontrado internamente e externamente e finalize orientando o colaborador a contatar seu tutor/lider.
 - Se existirem variacoes importantes de procedimento por contexto (ex: pre ou pos-arrematacao) e o usuário nao informar qual cenário se aplica, faca uma pergunta curta de esclarecimento antes do passo a passo final. Se ainda assim decidir responder, separe claramente os cenários e nunca misture fluxos distintos.
+- Quando um documento interno descrever um processo, reconstrua o fluxo completo em ordem antes de responder e confira se nenhuma etapa intermediaria ou final ficou de fora.
+- Em fluxos cartorarios, contratuais e registrais, nao pule etapas que estejam no material, mesmo que parecam administrativas, como agendamento, validacoes, videoconferencia, assinatura, protocolo, registro e pos-registro.
 - Quando o usuário trouxer prints, telas, comprovantes, contratos, notas devolutivas ou outros anexos visuais, interprete o material e use isso para orientar o assessor, inclusive sugerindo como responder o cliente quando fizer sentido.
 - Responda sempre em português, com linguagem profissional e acessível.
 - Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou listas numeradas sequenciais para passos, e "**destaque**" para pontos importantes.
@@ -3155,7 +3312,10 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       : { pages: [], metrics: null };
     const pages = notionSearchResult.pages;
     notionMetrics = notionSearchResult.metrics;
-    const context = stageTimer.measureSync('buildContext', () => buildContextFromPages(pages));
+    const notionSources = stageTimer.measureSync('buildNotionSources', () => getSourcesFromPages(pages));
+    const notionPersistableSources = stageTimer.measureSync('buildPersistableSources', () => buildPersistableSources(pages));
+    const context = stageTimer.measureSync('buildContext', () => buildContextFromPages(pages, question));
+    const clarificationAnswer = buildClarificationAnswer(question, pages);
 
     if (files.length && !readableFiles.length) {
       const errorPayload = {
@@ -3177,6 +3337,76 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
         return res.end();
       }
       return res.status(422).json(errorPayload);
+    }
+
+    if (clarificationAnswer) {
+      console.log(`[SmartAI][${requestId}] Pergunta ambigua detectada. Solicitando confirmacao antes da resposta final.`);
+
+      const totalMs = Date.now() - requestStartedAt;
+      const payload = {
+        answer: clarificationAnswer,
+        requestId,
+        chatId: chat.id,
+        userMessageId: userMessage.id,
+        needsClarification: true,
+        timings: {
+          totalMs,
+          aiMs: 0,
+          firstTokenMs: null,
+          stages: stageTimer.snapshot(),
+          notion: notionMetrics,
+        },
+        sources: notionSources,
+      };
+
+      const assistantMessage = await stageTimer.measure('saveAssistantMessage', async () => (
+        createMessage({
+          chatId: chat.id,
+          authorUserId: null,
+          role: 'assistant',
+          contentText: clarificationAnswer,
+          contentFormat: 'markdown',
+          requestId,
+          modelName: null,
+          totalLatencyMs: totalMs,
+          aiLatencyMs: 0,
+          firstTokenMs: null,
+          metadata: {
+            sources: notionSources,
+            unsupported,
+            fileIssues,
+            hasAttachments: files.length > 0,
+            needsClarification: true,
+          },
+        })
+      ));
+
+      if (notionPersistableSources.length) {
+        await stageTimer.measure('saveAssistantSources', async () => (
+          createAssistantSources(assistantMessage.id, notionPersistableSources)
+        ));
+      }
+
+      payload.assistantMessageId = assistantMessage.id;
+      payload.timings.stages = stageTimer.snapshot();
+
+      logStageMetrics(requestId, payload.timings.stages, notionMetrics);
+      logResponseDebug({
+        requestId,
+        answer: clarificationAnswer,
+        sources: notionSources,
+        totalMs,
+        aiMs: 0,
+        firstTokenMs: null,
+        chunkCount: 0,
+      });
+
+      if (wantsStream) {
+        writeStreamEvent(res, { type: 'done', data: payload });
+        return res.end();
+      }
+
+      return res.json(payload);
     }
 
     const userContentParts = [];
@@ -3239,12 +3469,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       });
     }
 
-    const {
-      messages,
-      notionSources,
-      notionPersistableSources,
-      openAiPayload,
-    } = stageTimer.measureSync('buildPrompt', () => {
+    const { openAiPayload } = stageTimer.measureSync('buildPrompt', () => {
       const nextMessages = [
         ...history.map((m) => ({ role: m.role, content: m.content })),
         {
@@ -3254,9 +3479,6 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       ];
 
       return {
-        messages: nextMessages,
-        notionSources: getSourcesFromPages(pages),
-        notionPersistableSources: buildPersistableSources(pages),
         openAiPayload: buildOpenAiPayload(nextMessages),
       };
     });

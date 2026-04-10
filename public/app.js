@@ -86,7 +86,7 @@ function sanitizeUploadSegment(value, fallback) {
   return cleaned || (fallback || 'arquivo');
 }
 
-function buildDirectUploadPath(file) {
+function buildDirectUploadPath(file, chatId) {
   if (!currentUser || !currentUser.id) {
     throw new Error('Sua sessão expirou. Faça login novamente para anexar arquivos.');
   }
@@ -96,7 +96,7 @@ function buildDirectUploadPath(file) {
   var extension = extensionIndex > 0 ? fileName.slice(extensionIndex).replace(/[^a-zA-Z0-9.]+/g, '').slice(0, 12) : '';
   var baseName = extensionIndex > 0 ? fileName.slice(0, extensionIndex) : fileName;
   var safeName = sanitizeUploadSegment(baseName, 'arquivo');
-  var folder = currentChatId ? ('chat-' + currentChatId) : ('draft-' + Date.now());
+  var folder = chatId ? ('chat-' + chatId) : ('draft-' + Date.now());
 
   return 'incoming/user-' + currentUser.id + '/' + sanitizeUploadSegment(folder, 'draft') + '/' + safeName + extension;
 }
@@ -109,7 +109,7 @@ async function getBlobUploadClient() {
   return blobUploadModulePromise;
 }
 
-async function uploadAttachmentFilesDirect(files) {
+async function uploadAttachmentFilesDirect(files, chatId) {
   if (!files || !files.length) return [];
 
   var blobClient = await getBlobUploadClient();
@@ -119,7 +119,7 @@ async function uploadAttachmentFilesDirect(files) {
     var file = files[index];
     showToast('Enviando anexo ' + (index + 1) + ' de ' + files.length + '...');
 
-    var blob = await blobClient.upload(buildDirectUploadPath(file), file, {
+    var blob = await blobClient.upload(buildDirectUploadPath(file, chatId), file, {
       access: 'private',
       handleUploadUrl: '/api/blob/upload',
       multipart: file.size >= 5 * 1024 * 1024,
@@ -516,6 +516,80 @@ function isRequestConversationVisible(requestState) {
   return !!requestState && currentMessages === requestState.messages;
 }
 
+function getChatSortTimestamp(chat) {
+  var value = chat && (chat.updatedAt || chat.lastMessageAt || chat.createdAt);
+  var time = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function upsertChatSummary(chat) {
+  if (!chat || !chat.id) return;
+
+  var nextChat = Object.assign({}, chat);
+  var existingIndex = chatList.findIndex(function (item) {
+    return item.id === nextChat.id;
+  });
+
+  if (existingIndex > -1) {
+    chatList[existingIndex] = Object.assign({}, chatList[existingIndex], nextChat);
+  } else {
+    chatList.push(nextChat);
+  }
+
+  chatList.sort(function (left, right) {
+    return getChatSortTimestamp(right) - getChatSortTimestamp(left)
+      || Number(right.id || 0) - Number(left.id || 0);
+  });
+
+  renderChatList();
+  highlightActiveChat();
+}
+
+function buildPendingChatPreview(text, files) {
+  var normalizedText = String(text || '').trim();
+  if (normalizedText) {
+    return normalizedText.slice(0, 160);
+  }
+
+  if (files && files.length) {
+    return '(mensagem com anexo)';
+  }
+
+  return 'Sem mensagens ainda';
+}
+
+async function createChatForRequest(question, filesToSend, requestState) {
+  var response = await fetch('/api/chats', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      question: question || '',
+      attachmentNames: (filesToSend || [])
+        .map(function (file) { return file && file.name ? file.name : ''; })
+        .filter(Boolean)
+    })
+  });
+  var payload = await safeReadJson(response);
+
+  if (!response.ok) {
+    throw new Error(payload.error || 'Não foi possível criar o chat.');
+  }
+
+  var chat = Object.assign({}, payload.chat || {}, {
+    lastMessagePreview: buildPendingChatPreview(question, filesToSend),
+    updatedAt: (payload.chat && payload.chat.updatedAt) || new Date().toISOString()
+  });
+
+  requestState.chatId = chat.id;
+
+  if (isRequestConversationVisible(requestState)) {
+    currentChatId = chat.id;
+  }
+
+  upsertChatSummary(chat);
+  return chat;
+}
+
 function syncRequestMeta(requestState, payload) {
   if (!requestState || !payload) return;
 
@@ -631,12 +705,16 @@ async function sendMessage() {
   };
 
   try {
+    if (!requestState.chatId) {
+      await createChatForRequest(text, filesToSend, requestState);
+    }
+
     var fetchOptions;
 
     if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE !== 'blob_direct') {
       var form = new FormData();
       form.append('question', text || '');
-      if (currentChatId) form.append('chatId', String(currentChatId));
+      if (requestState.chatId) form.append('chatId', String(requestState.chatId));
       form.append('history', JSON.stringify(chatHistory.slice(-10)));
       filesToSend.forEach(function (file) { form.append('files', file); });
       fetchOptions = {
@@ -651,7 +729,7 @@ async function sendMessage() {
       var uploadedAttachments = [];
 
       if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE === 'blob_direct') {
-        uploadedAttachments = await uploadAttachmentFilesDirect(filesToSend);
+        uploadedAttachments = await uploadAttachmentFilesDirect(filesToSend, requestState.chatId);
       }
 
       fetchOptions = {
@@ -663,7 +741,7 @@ async function sendMessage() {
         },
         body: JSON.stringify({
           question: text,
-          chatId: currentChatId,
+          chatId: requestState.chatId,
           history: chatHistory.slice(-10),
           attachments: uploadedAttachments
         })
