@@ -7,9 +7,12 @@ var chatList = [];
 var isTyping = false;
 var typingEl = null;
 var toastTimer;
-var MAX_ATTACHMENT_FILES = 3;
-var MAX_ATTACHMENT_TOTAL_BYTES = 4 * 1024 * 1024;
-var MAX_PROFILE_PHOTO_BYTES = 4 * 1024 * 1024;
+var MAX_ATTACHMENT_FILES = 5;
+var MAX_ATTACHMENT_FILE_BYTES = 30 * 1024 * 1024;
+var MAX_ATTACHMENT_TOTAL_BYTES = 30 * 1024 * 1024;
+var MAX_PROFILE_PHOTO_BYTES = 30 * 1024 * 1024;
+var ATTACHMENT_UPLOAD_MODE = 'multipart';
+var blobUploadModulePromise = null;
 
 var AI_AVATAR_ASSET = 'logo-smart.png';
 
@@ -20,6 +23,120 @@ function formatByteSize(bytes) {
   }
 
   return (value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + 'MB';
+}
+
+function applyClientConfig(config) {
+  var uploads = config && config.uploads ? config.uploads : {};
+  var limits = config && config.limits ? config.limits : {};
+
+  if (typeof uploads.attachmentMode === 'string' && uploads.attachmentMode) {
+    ATTACHMENT_UPLOAD_MODE = uploads.attachmentMode;
+  }
+
+  if (typeof limits.maxAttachmentFiles === 'number' && limits.maxAttachmentFiles > 0) {
+    MAX_ATTACHMENT_FILES = limits.maxAttachmentFiles;
+  }
+  if (typeof limits.maxAttachmentFileBytes === 'number' && limits.maxAttachmentFileBytes > 0) {
+    MAX_ATTACHMENT_FILE_BYTES = limits.maxAttachmentFileBytes;
+  }
+  if (typeof limits.maxAttachmentTotalBytes === 'number' && limits.maxAttachmentTotalBytes > 0) {
+    MAX_ATTACHMENT_TOTAL_BYTES = limits.maxAttachmentTotalBytes;
+  }
+  if (typeof limits.maxProfilePhotoBytes === 'number' && limits.maxProfilePhotoBytes > 0) {
+    MAX_PROFILE_PHOTO_BYTES = limits.maxProfilePhotoBytes;
+  }
+
+  updateInputHint();
+}
+
+function updateInputHint() {
+  var hintEl = document.getElementById('inputHint');
+  if (!hintEl) return;
+
+  var hint = 'Enter para enviar · Shift+Enter nova linha · Até '
+    + MAX_ATTACHMENT_FILES + ' arquivos e '
+    + formatByteSize(MAX_ATTACHMENT_TOTAL_BYTES) + ' por envio';
+
+  if (ATTACHMENT_UPLOAD_MODE === 'blob_direct') {
+    hint += ' · upload direto habilitado';
+  }
+
+  hintEl.textContent = hint;
+}
+
+async function loadClientConfig() {
+  try {
+    var response = await fetch('/api/client-config');
+    var payload = await safeReadJson(response);
+    if (response.ok) {
+      applyClientConfig(payload);
+    }
+  } catch (error) {}
+}
+
+function sanitizeUploadSegment(value, fallback) {
+  var cleaned = String(value || fallback || 'arquivo')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80);
+
+  return cleaned || (fallback || 'arquivo');
+}
+
+function buildDirectUploadPath(file) {
+  if (!currentUser || !currentUser.id) {
+    throw new Error('Sua sessão expirou. Faça login novamente para anexar arquivos.');
+  }
+
+  var fileName = String(file && file.name ? file.name : 'arquivo');
+  var extensionIndex = fileName.lastIndexOf('.');
+  var extension = extensionIndex > 0 ? fileName.slice(extensionIndex).replace(/[^a-zA-Z0-9.]+/g, '').slice(0, 12) : '';
+  var baseName = extensionIndex > 0 ? fileName.slice(0, extensionIndex) : fileName;
+  var safeName = sanitizeUploadSegment(baseName, 'arquivo');
+  var folder = currentChatId ? ('chat-' + currentChatId) : ('draft-' + Date.now());
+
+  return 'incoming/user-' + currentUser.id + '/' + sanitizeUploadSegment(folder, 'draft') + '/' + safeName + extension;
+}
+
+async function getBlobUploadClient() {
+  if (!blobUploadModulePromise) {
+    blobUploadModulePromise = import('/blob-upload-client.js');
+  }
+
+  return blobUploadModulePromise;
+}
+
+async function uploadAttachmentFilesDirect(files) {
+  if (!files || !files.length) return [];
+
+  var blobClient = await getBlobUploadClient();
+  var uploaded = [];
+
+  for (var index = 0; index < files.length; index += 1) {
+    var file = files[index];
+    showToast('Enviando anexo ' + (index + 1) + ' de ' + files.length + '...');
+
+    var blob = await blobClient.upload(buildDirectUploadPath(file), file, {
+      access: 'private',
+      handleUploadUrl: '/api/blob/upload',
+      multipart: file.size >= 5 * 1024 * 1024,
+      contentType: file.type || undefined
+    });
+
+    uploaded.push({
+      storagePath: blob.url,
+      pathname: blob.pathname,
+      originalName: file.name,
+      displayName: file.name,
+      mimeType: blob.contentType || file.type || '',
+      size: file.size || 0
+    });
+  }
+
+  return uploaded;
 }
 
 function getAiAvatarHtml(extraClass) {
@@ -410,6 +527,11 @@ async function sendMessage() {
     return;
   }
 
+  if (filesToSend.some(function (file) { return Number(file && file.size ? file.size : 0) > MAX_ATTACHMENT_FILE_BYTES; })) {
+    showToast('Cada arquivo deve ter no máximo ' + formatByteSize(MAX_ATTACHMENT_FILE_BYTES) + '.');
+    return;
+  }
+
   if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
     showToast('O total de anexos por envio deve ficar em até ' + formatByteSize(MAX_ATTACHMENT_TOTAL_BYTES) + '.');
     return;
@@ -434,7 +556,7 @@ async function sendMessage() {
   showTyping();
 
   var fetchOptions;
-  if (filesToSend.length > 0) {
+  if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE !== 'blob_direct') {
     var form = new FormData();
     form.append('question', text || '');
     if (currentChatId) form.append('chatId', String(currentChatId));
@@ -449,6 +571,12 @@ async function sendMessage() {
       body: form
     };
   } else {
+    var uploadedAttachments = [];
+
+    if (filesToSend.length > 0 && ATTACHMENT_UPLOAD_MODE === 'blob_direct') {
+      uploadedAttachments = await uploadAttachmentFilesDirect(filesToSend);
+    }
+
     fetchOptions = {
       method: 'POST',
       headers: {
@@ -459,7 +587,8 @@ async function sendMessage() {
       body: JSON.stringify({
         question: text,
         chatId: currentChatId,
-        history: chatHistory.slice(-10)
+        history: chatHistory.slice(-10),
+        attachments: uploadedAttachments
       })
     };
   }
@@ -690,18 +819,39 @@ function safeReadJson(response) {
   });
 }
 
+function getSourceKind(source) {
+  if (!source) return 'notion';
+  if (source.sourceType === 'web_url') return 'web';
+  if (source.metadata && source.metadata.kind === 'web') return 'web';
+  return 'notion';
+}
+
+function renderSourceList(label, sources) {
+  if (!sources || sources.length === 0) return '';
+
+  return '<div class="msg-sources">'
+    + '<div class="msg-sources-label">' + escapeHtml(label) + '</div>'
+    + sources.map(function (source) {
+      var url = source.url ? ' href="' + source.url + '" target="_blank" rel="noopener"' : '';
+      return '<a class="msg-source-link"' + url + '>'
+        + escapeHtml(source.title || 'Fonte') + '</a>';
+    }).join('')
+    + '</div>';
+}
+
 function buildAssistantExtrasHtml(data) {
   var html = '';
 
   if (data.sources && data.sources.length > 0) {
-    html += '<div class="msg-sources">'
-      + '<div class="msg-sources-label">Fontes consultadas:</div>'
-      + data.sources.map(function (source) {
-        var url = source.url ? ' href="' + source.url + '" target="_blank" rel="noopener"' : '';
-        return '<a class="msg-source-link"' + url + '>'
-          + '📄 ' + escapeHtml(source.title || 'Fonte') + '</a>';
-      }).join('')
-      + '</div>';
+    var notionSources = data.sources.filter(function (source) {
+      return getSourceKind(source) !== 'web';
+    });
+    var webSources = data.sources.filter(function (source) {
+      return getSourceKind(source) === 'web';
+    });
+
+    html += renderSourceList('Fontes internas (Notion):', notionSources);
+    html += renderSourceList('Fontes da Web:', webSources);
   }
 
   if (data.unsupported && data.unsupported.length > 0) {
@@ -793,7 +943,7 @@ function formatResponse(text) {
     return '<div class="ai-markdown"><p></p></div>';
   }
 
-  var source = String(text).replace(/\r\n/g, '\n').trim();
+  var source = normalizeAssistantMarkdownForDisplay(String(text).replace(/\r\n/g, '\n').trim());
   var lines = source.split('\n');
   var blocks = [];
   var paragraphLines = [];
@@ -857,11 +1007,12 @@ function formatResponse(text) {
       return;
     }
 
-    var headingMatch = /^(#{2,3})\s+(.+)$/.exec(trimmed);
+    var headingMatch = /^(#{2,6})\s+(.+)$/.exec(trimmed);
     if (headingMatch) {
+      var headingLevel = Math.min(3, headingMatch[1].length);
       flushParagraph();
       flushList();
-      blocks.push('<h' + headingMatch[1].length + '>' + formatInlineMarkdown(headingMatch[2]) + '</h' + headingMatch[1].length + '>');
+      blocks.push('<h' + headingLevel + '>' + formatInlineMarkdown(headingMatch[2]) + '</h' + headingLevel + '>');
       return;
     }
 
@@ -896,6 +1047,13 @@ function formatResponse(text) {
   }
 
   return '<div class="ai-markdown">' + blocks.join('') + '</div>';
+}
+
+function normalizeAssistantMarkdownForDisplay(text) {
+  return String(text || '')
+    .replace(/^(#{4,})\s+/gm, '## ')
+    .replace(/(^\d+\.\s[^\n]+)\n{2,}(?=\d+\.\s)/gm, '$1\n')
+    .replace(/(^[-*]\s[^\n]+)\n{2,}(?=[-*]\s)/gm, '$1\n');
 }
 
 function formatInlineMarkdown(text) {
@@ -1127,6 +1285,11 @@ function handleFileAttach(e) {
 function addAttachedFiles(fileList) {
   var files = Array.from(fileList || []).filter(Boolean);
   if (!files.length) return;
+
+  if (files.some(function (file) { return Number(file && file.size ? file.size : 0) > MAX_ATTACHMENT_FILE_BYTES; })) {
+    showToast('Cada arquivo deve ter no máximo ' + formatByteSize(MAX_ATTACHMENT_FILE_BYTES) + '.');
+    return;
+  }
 
   var nextFiles = attachedFiles.concat(files);
   if (nextFiles.length > MAX_ATTACHMENT_FILES) {
@@ -1561,9 +1724,11 @@ function handleAuthResultQuery() {
 
 (async function init() {
   applyTheme(loadStoredTheme(), { remote: false, silent: true });
+  updateInputHint();
   initDragAndDrop();
   bindAuthShortcuts();
   handleAuthResultQuery();
+  await loadClientConfig();
 
   try {
     var response = await fetch('/api/auth/me');

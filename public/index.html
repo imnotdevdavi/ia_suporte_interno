@@ -213,7 +213,7 @@
         </div>
       </div>
 
-      <div class="input-hint">Enter para enviar · Shift+Enter nova linha · Até 3 arquivos e 4MB por envio</div>
+      <div class="input-hint" id="inputHint">Enter para enviar · Shift+Enter nova linha · Até 5 arquivos e 30MB por envio</div>
     </div>
   </div>
 </div>
@@ -340,6 +340,18 @@
 <input type="file" id="fileInput" multiple onchange="handleFileAttach(event)">
 <input type="file" id="profilePhotoInput" accept="image/png,image/jpeg,image/webp" onchange="handleProfilePhoto(event)" style="display:none;">
 
+<script type="importmap">
+{
+  "imports": {
+    "@vercel/blob/client": "/vendor/@vercel/blob/client.js",
+    "crypto": "/vendor/@vercel/blob/crypto-browser.js",
+    "stream": "/vendor/@vercel/blob/stream-browser.js",
+    "undici": "/vendor/@vercel/blob/undici-browser.js",
+    "is-node-process": "/vendor/is-node-process/index.mjs",
+    "is-buffer": "/vendor/shims/is-buffer.js"
+  }
+}
+</script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -11,21 +11,25 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import fs from 'fs';
 import mammoth from 'mammoth';
+import { handleUpload } from '@vercel/blob/client';
 import { createAsyncExpiringCache } from './lib/async-cache.js';
 import { pool, query, withTransaction } from './lib/db.js';
 import {
+  downloadPrivateBlobToFile,
   LOCAL_STORAGE_PROVIDER,
   PRIVATE_BLOB_STORAGE_PROVIDER,
   assertPersistentFileStorageConfigured,
   buildBlobObjectPath,
   deleteBlobObject,
+  getMaxAttachmentFileBytes,
   getMaxAttachmentFiles,
   getMaxAttachmentRequestBytes,
   getMaxProfilePhotoBytes,
-  getMaxUploadBytes,
+  getMaxServerUploadBytes,
   isBlobStoragePath,
   isBlobStorageProvider,
   isVercelRuntime,
+  shouldUseDirectAttachmentUploads,
   shouldUseBlobStorage,
   streamPrivateBlobToResponse,
   uploadLocalFileToBlob,
@@ -78,13 +82,33 @@ let pdfParseLoader = null;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const VERCEL_BLOB_DIST_DIR = path.join(__dirname, 'node_modules', '@vercel', 'blob', 'dist');
+const IS_NODE_PROCESS_DIST_DIR = path.join(__dirname, 'node_modules', 'is-node-process', 'lib');
 const DEFAULT_LOG_DIR = path.join(__dirname, 'logs');
 const USE_BLOB_STORAGE = shouldUseBlobStorage();
+const DIRECT_ATTACHMENT_UPLOADS_ENABLED = shouldUseDirectAttachmentUploads();
 const USE_LOCAL_PERSISTENT_STORAGE = !USE_BLOB_STORAGE && !isVercelRuntime();
-const MAX_UPLOAD_FILE_SIZE = getMaxUploadBytes();
+const MAX_MULTIPART_FILE_SIZE = getMaxServerUploadBytes();
+const MAX_ATTACHMENT_FILE_SIZE = getMaxAttachmentFileBytes();
 const MAX_ATTACHMENT_FILES = getMaxAttachmentFiles();
 const MAX_ATTACHMENT_REQUEST_SIZE = getMaxAttachmentRequestBytes();
 const PROFILE_MAX_FILE_SIZE = getMaxProfilePhotoBytes();
+const ENABLE_WEB_SEARCH = String(process.env.SMARTAI_ENABLE_WEB_SEARCH || 'true').trim().toLowerCase() !== 'false';
+const MAX_MODEL_OUTPUT_TOKENS = Number.parseInt(
+  String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '8192').trim(),
+  10
+) || 8192;
+const WEB_SEARCH_TOOL = {
+  type: 'web_search_preview',
+  search_context_size: 'high',
+  user_location: {
+    type: 'approximate',
+    city: process.env.SMARTAI_SEARCH_CITY || 'Belem',
+    country: process.env.SMARTAI_SEARCH_COUNTRY || 'BR',
+    region: process.env.SMARTAI_SEARCH_REGION || 'Para',
+    timezone: process.env.SMARTAI_SEARCH_TIMEZONE || 'America/Belem',
+  },
+};
 
 function resolveProjectPath(rawValue, fallbackPath) {
   const value = String(rawValue || '').trim();
@@ -197,7 +221,23 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '20mb' }));
+app.use('/vendor/@vercel/blob', express.static(VERCEL_BLOB_DIST_DIR));
+app.use('/vendor/is-node-process', express.static(IS_NODE_PROCESS_DIST_DIR));
 app.use(express.static(PUBLIC_DIR));
+app.get('/api/client-config', (req, res) => {
+  res.json({
+    uploads: {
+      attachmentMode: DIRECT_ATTACHMENT_UPLOADS_ENABLED ? 'blob_direct' : 'multipart',
+    },
+    limits: {
+      maxAttachmentFiles: MAX_ATTACHMENT_FILES,
+      maxAttachmentTotalBytes: MAX_ATTACHMENT_REQUEST_SIZE,
+      maxAttachmentFileBytes: MAX_ATTACHMENT_FILE_SIZE,
+      maxUploadFileBytes: MAX_ATTACHMENT_FILE_SIZE,
+      maxProfilePhotoBytes: PROFILE_MAX_FILE_SIZE,
+    },
+  });
+});
 
 const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -222,7 +262,7 @@ if (USE_LOCAL_PERSISTENT_STORAGE) {
 const upload = multer({
   dest: TEMP_UPLOAD_DIR,
   limits: {
-    fileSize: MAX_UPLOAD_FILE_SIZE,
+    fileSize: MAX_MULTIPART_FILE_SIZE,
     files: MAX_ATTACHMENT_FILES,
   },
 });
@@ -236,30 +276,34 @@ const GOOGLE_OAUTH_STATE_DURATION_MS = 1000 * 60 * 10;
 /* ═══════════════════════════════════════════════
    NOTION
 ═══════════════════════════════════════════════ */
-const NOTION_SEARCH_LIMIT = 8;
-const INITIAL_RESULT_LIMIT = 4;
-const FALLBACK_RESULT_LIMIT = 6;
-const FINAL_RESULT_LIMIT = 4;
-const INITIAL_CANDIDATE_LIMIT = 10;
-const FALLBACK_CANDIDATE_LIMIT = 14;
-const INITIAL_BLOCK_LIMIT = 180;
-const FALLBACK_BLOCK_LIMIT = 320;
-const INITIAL_PAGE_CHARS = 9000;
-const FALLBACK_PAGE_CHARS = 15000;
-const INITIAL_HYDRATION_LIMIT = 5;
-const FALLBACK_HYDRATION_LIMIT = 8;
+const NOTION_SEARCH_LIMIT = 12;
+const INITIAL_RESULT_LIMIT = 5;
+const FALLBACK_RESULT_LIMIT = 8;
+const FINAL_RESULT_LIMIT = 5;
+const INITIAL_CANDIDATE_LIMIT = 12;
+const FALLBACK_CANDIDATE_LIMIT = 18;
+const INITIAL_BLOCK_LIMIT = 260;
+const FALLBACK_BLOCK_LIMIT = 420;
+const INITIAL_PAGE_CHARS = 14000;
+const FALLBACK_PAGE_CHARS = 22000;
+const INITIAL_HYDRATION_LIMIT = 6;
+const FALLBACK_HYDRATION_LIMIT = 10;
 const NOTION_HYDRATION_CONCURRENCY = 3;
 const NOTION_SEARCH_CACHE_TTL_MS = 1000 * 60 * 2;
 const NOTION_PAGE_CACHE_TTL_MS = 1000 * 60 * 15;
 const NOTION_SEARCH_CACHE_MAX_ENTRIES = 200;
 const NOTION_PAGE_CACHE_MAX_ENTRIES = 400;
-const MAX_SECTION_CHARS = 1200;
-const MAX_CONTEXT_SNIPPETS = 8;
-const MAX_SNIPPETS_PER_PAGE = 3;
+const MAX_SECTION_CHARS = 1800;
+const MAX_CONTEXT_PAGES = 3;
+const PRIMARY_PAGE_CONTEXT_CHARS = 5200;
+const SECONDARY_PAGE_CONTEXT_CHARS = 2800;
+const MAX_SNIPPETS_PER_PAGE = 4;
+const CONTEXT_SNIPPET_NEIGHBOR_WINDOW = 1;
 const MIN_RELEVANT_SCORE = 4;
 const MAX_FILE_CHARS = 12000;
 const MAX_PDF_IMAGE_PAGES = 4;
 const PDF_IMAGE_DPI = 144;
+const PDF_IMAGE_DESIRED_WIDTH = 1440;
 const notionSearchCache = createAsyncExpiringCache({
   ttlMs: NOTION_SEARCH_CACHE_TTL_MS,
   maxEntries: NOTION_SEARCH_CACHE_MAX_ENTRIES,
@@ -525,8 +569,12 @@ function mergeCandidates(primary, fallback, resultLimit = FINAL_RESULT_LIMIT) {
 
 function buildPrimaryQueries(question) {
   const keywordQuery = buildKeywordFallback(question);
-  const normalizedQuestion = normalizeQuery(question).slice(0, 300);
-  return [...new Set([normalizedQuestion, keywordQuery].filter(Boolean))];
+  const normalizedQuestion = expandQueryWithAliases(question).slice(0, 300);
+  return [...new Set([
+    normalizedQuestion,
+    ...buildPhraseQueries(question),
+    keywordQuery,
+  ].filter(Boolean))];
 }
 
 function buildFallbackQueries(question, history = []) {
@@ -537,7 +585,7 @@ function buildFallbackQueries(question, history = []) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  const withHistory = recentHistory ? `${question} ${recentHistory}`.slice(0, 450) : '';
+  const withHistory = recentHistory ? expandQueryWithAliases(`${question} ${recentHistory}`).slice(0, 450) : '';
   const historyKeywords = withHistory ? buildKeywordFallback(withHistory) : '';
   return [...new Set([
     ...buildPrimaryQueries(question),
@@ -551,6 +599,32 @@ function buildKeywordFallback(question) {
     .slice(0, 8)
     .join(' ')
     .slice(0, 220);
+}
+
+function expandQueryWithAliases(text) {
+  const normalizedText = normalizeQuery(text);
+  if (!normalizedText) return '';
+
+  const expandedTokens = tokenizeForMatch(normalizedText);
+  if (!expandedTokens.length) return normalizedText;
+
+  return normalizeQuery(`${normalizedText} ${expandedTokens.join(' ')}`);
+}
+
+function buildPhraseQueries(question) {
+  const terms = buildQuestionTerms(question);
+  const phrases = [];
+
+  for (let size = 3; size >= 2; size -= 1) {
+    for (let index = 0; index <= terms.length - size; index += 1) {
+      phrases.push(terms.slice(index, index + size).join(' '));
+      if (phrases.length >= 4) {
+        return [...new Set(phrases.filter(Boolean))];
+      }
+    }
+  }
+
+  return [...new Set(phrases.filter(Boolean))];
 }
 
 function normalizeQuery(text) {
@@ -769,7 +843,8 @@ function selectRelevantSnippets(pageContent, title, question) {
   if (!sections.length) return [];
 
   const scored = sections
-    .map((section) => ({
+    .map((section, index) => ({
+      index,
       text: section.text,
       label: section.label,
       score: scoreSection(section, title, question),
@@ -784,6 +859,7 @@ function selectRelevantSnippets(pageContent, title, question) {
   if (!titleScore) return [];
 
   return [{
+    index: 0,
     text: sections[0].text,
     label: sections[0].label,
     score: titleScore,
@@ -874,7 +950,61 @@ function tokenizeForMatch(text) {
   return normalizeForMatch(text)
     .split(/\s+/)
     .map(normalizeTerm)
+    .map(resolveBusinessTermAlias)
     .filter(Boolean);
+}
+
+function resolveBusinessTermAlias(term) {
+  const normalized = normalizeTerm(term);
+  if (!normalized) return '';
+
+  const mapped = TERM_ALIAS_MAP.get(normalized);
+  if (mapped) return mapped;
+
+  let bestCandidate = '';
+  let bestDistance = Infinity;
+
+  for (const candidate of KNOWN_BUSINESS_TERMS) {
+    if (Math.abs(candidate.length - normalized.length) > 2) continue;
+
+    const threshold = normalized.length <= 4 ? 1 : 2;
+    const distance = computeEditDistance(normalized, candidate, threshold);
+    if (distance <= threshold && distance < bestDistance) {
+      bestCandidate = candidate;
+      bestDistance = distance;
+    }
+  }
+
+  return bestCandidate || normalized;
+}
+
+function computeEditDistance(left, right, maxDistance = Infinity) {
+  if (left === right) return 0;
+  if (!left) return right.length;
+  if (!right) return left.length;
+  if (Math.abs(left.length - right.length) > maxDistance) return maxDistance + 1;
+
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    let minInRow = row;
+
+    for (let col = 1; col <= right.length; col += 1) {
+      const insertCost = current[col - 1] + 1;
+      const deleteCost = previous[col] + 1;
+      const replaceCost = previous[col - 1] + (left[row - 1] === right[col - 1] ? 0 : 1);
+      const next = Math.min(insertCost, deleteCost, replaceCost);
+
+      current[col] = next;
+      if (next < minInRow) minInRow = next;
+    }
+
+    previous = current;
+    if (minInRow > maxDistance) return maxDistance + 1;
+  }
+
+  return previous[right.length];
 }
 
 function normalizeTerm(term) {
@@ -910,27 +1040,106 @@ function normalizeExtractedText(text, maxChars = Infinity) {
     .slice(0, maxChars);
 }
 
+function selectPagesForContext(pages = []) {
+  if (!pages.length) return [];
+
+  const ranked = [...pages]
+    .filter((page) => page.content || page.snippets?.length)
+    .sort((left, right) => right.score - left.score);
+
+  if (!ranked.length) return [];
+
+  const topScore = ranked[0].score || 0;
+  return ranked
+    .filter((page, index) => (
+      index === 0
+      || page.score >= Math.max(MIN_RELEVANT_SCORE, Math.round(topScore * 0.55))
+    ))
+    .slice(0, MAX_CONTEXT_PAGES);
+}
+
+function buildPageContextExcerpt(page, maxChars) {
+  const sections = page.sections?.length
+    ? page.sections
+    : page.content
+      ? [{ label: '', text: page.content }]
+      : [];
+
+  if (!sections.length) return '';
+
+  const selectedIndexes = new Set();
+  const orderedSnippets = [...(page.snippets || [])].sort((left, right) => right.score - left.score);
+
+  orderedSnippets.forEach((snippet) => {
+    if (!Number.isInteger(snippet.index)) return;
+
+    for (let offset = -CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset <= CONTEXT_SNIPPET_NEIGHBOR_WINDOW; offset += 1) {
+      const nextIndex = snippet.index + offset;
+      if (nextIndex >= 0 && nextIndex < sections.length) {
+        selectedIndexes.add(nextIndex);
+      }
+    }
+  });
+
+  if (!selectedIndexes.size) {
+    selectedIndexes.add(0);
+  }
+
+  const orderedIndexes = [...selectedIndexes].sort((left, right) => left - right);
+  const parts = [];
+  let usedChars = 0;
+
+  for (const index of orderedIndexes) {
+    const section = sections[index];
+    if (!section?.text) continue;
+
+    const labeledText = section.label
+      ? `Secao: ${section.label}\n${section.text}`
+      : section.text;
+    const normalized = normalizeExtractedText(labeledText, maxChars - usedChars);
+    if (!normalized) continue;
+
+    if (usedChars && usedChars + normalized.length > maxChars) {
+      break;
+    }
+
+    parts.push(normalized);
+    usedChars += normalized.length + 2;
+
+    if (usedChars >= maxChars) break;
+  }
+
+  if (!parts.length) {
+    return normalizeExtractedText(sections[0].text, maxChars);
+  }
+
+  return normalizeExtractedText(parts.join('\n\n'), maxChars);
+}
+
 function buildContextFromPages(pages) {
-  const snippets = pages
-    .flatMap((page) => page.snippets.map((snippet) => ({
-      title: page.title,
-      url: page.url,
-      text: snippet.text,
-      label: snippet.label,
-      score: snippet.score,
-    })))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_CONTEXT_SNIPPETS);
+  const selectedPages = selectPagesForContext(pages);
+  if (!selectedPages.length) return null;
 
-  if (!snippets.length) return null;
+  return selectedPages
+    .map((page, index) => {
+      const contextLimit = index === 0 ? PRIMARY_PAGE_CONTEXT_CHARS : SECONDARY_PAGE_CONTEXT_CHARS;
+      const excerpt = buildPageContextExcerpt(page, contextLimit);
+      const lines = [
+        `Documento: ${page.title}`,
+        `URL: ${page.url}`,
+      ];
 
-  return snippets
-    .map((snippet, index) => {
-      const lines = [`Documento: ${snippet.title}`];
-      if (snippet.label) lines.push(`Secao: ${snippet.label}`);
-      lines.push(`URL: ${snippet.url}`);
-      lines.push('Trecho relevante:');
-      lines.push(snippet.text);
+      const centralSections = [...new Set(
+        (page.snippets || [])
+          .map((snippet) => snippet.label)
+          .filter(Boolean)
+      )];
+      if (centralSections.length) {
+        lines.push(`Secoes centrais: ${centralSections.join(' | ')}`);
+      }
+
+      lines.push('Conteudo relevante consolidado:');
+      lines.push(excerpt || normalizeExtractedText(page.content, contextLimit));
       return lines.join('\n');
     })
     .join('\n\n---\n\n');
@@ -949,6 +1158,35 @@ const STOP_WORDS = new Set([
   'por', 'porque', 'qual', 'quais', 'quando', 'que', 'quem', 'sao', 'são', 'se',
   'sem', 'ser', 'seu', 'sua', 'sobre', 'tambem', 'também', 'tem', 'ter', 'um',
   'uma', 'umas', 'uns'
+]);
+const TERM_ALIAS_MAP = new Map([
+  ['itib', 'itbi'],
+  ['itb1', 'itbi'],
+  ['cvv', 'ccv'],
+  ['ccvv', 'ccv'],
+  ['diligente', 'diligencia'],
+  ['diligentes', 'diligencia'],
+  ['despachantes', 'despachante'],
+  ['rerratificao', 'rerratificacao'],
+  ['rerratificaao', 'rerratificacao'],
+  ['arrematacaoo', 'arrematacao'],
+]);
+const KNOWN_BUSINESS_TERMS = new Set([
+  'itbi',
+  'ccv',
+  'diligencia',
+  'diligente',
+  'despachante',
+  'arrematacao',
+  'pre',
+  'pos',
+  'matricula',
+  'nota',
+  'devolutiva',
+  'rerratificacao',
+  'contrato',
+  'parceiro',
+  'planilha',
 ]);
 
 /* ═══════════════════════════════════════════════
@@ -1077,7 +1315,7 @@ function looksLikeMojibake(text = '') {
 async function loadPdfParse() {
   if (!pdfParseLoader) {
     pdfParseLoader = import('pdf-parse')
-      .then((mod) => mod.default || mod)
+      .then((mod) => mod)
       .catch((error) => {
         console.warn('pdf-parse indisponivel neste ambiente. PDFs texto podem falhar:', error?.message || error);
         return null;
@@ -1090,11 +1328,18 @@ async function loadPdfParse() {
 async function extractPdfText(tmpPath) {
   try {
     const pdfParse = await loadPdfParse();
-    if (pdfParse) {
+    const PDFParse = pdfParse?.PDFParse;
+    if (PDFParse) {
       const buffer = await fs.promises.readFile(tmpPath);
-      const result = await pdfParse(buffer);
-      const parsedText = normalizeExtractedText(result.text, MAX_FILE_CHARS);
-      if (parsedText) return parsedText;
+      const parser = new PDFParse({ data: buffer });
+
+      try {
+        const result = await parser.getText();
+        const parsedText = normalizeExtractedText(result.text, MAX_FILE_CHARS);
+        if (parsedText) return parsedText;
+      } finally {
+        await parser.destroy().catch(() => {});
+      }
     }
   } catch {}
 
@@ -1111,6 +1356,48 @@ async function extractPdfText(tmpPath) {
 }
 
 async function extractPdfPagesAsImages(tmpPath, originalname) {
+  try {
+    const pdfParse = await loadPdfParse();
+    const PDFParse = pdfParse?.PDFParse;
+
+    if (PDFParse) {
+      const buffer = await fs.promises.readFile(tmpPath);
+      const parser = new PDFParse({ data: buffer });
+
+      try {
+        const screenshot = await parser.getScreenshot({
+          first: MAX_PDF_IMAGE_PAGES,
+          imageDataUrl: false,
+          imageBuffer: true,
+          desiredWidth: PDF_IMAGE_DESIRED_WIDTH,
+        });
+        const images = (screenshot.pages || [])
+          .map((page, index) => {
+            const data = Buffer.isBuffer(page?.data)
+              ? page.data
+              : page?.data
+                ? Buffer.from(page.data)
+                : null;
+            if (!data?.length) return null;
+
+            return {
+              type: 'image',
+              mime: 'image/png',
+              base64: data.toString('base64'),
+              name: `${originalname} - pagina ${index + 1}`,
+            };
+          })
+          .filter(Boolean);
+
+        if (images.length) {
+          return images;
+        }
+      } finally {
+        await parser.destroy().catch(() => {});
+      }
+    }
+  } catch {}
+
   const tempDir = await fs.promises.mkdtemp(path.join(TEMP_UPLOAD_DIR, 'pdf-pages-'));
   const outputPrefix = path.join(tempDir, 'page');
 
@@ -1130,7 +1417,7 @@ async function extractPdfPagesAsImages(tmpPath, originalname) {
       .filter((file) => /^page-\d+\.jpg$/i.test(file))
       .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
 
-    const images = await Promise.all(
+    return Promise.all(
       files.map(async (file, index) => {
         const fullPath = path.join(tempDir, file);
         const base64 = await fs.promises.readFile(fullPath, { encoding: 'base64' });
@@ -1142,8 +1429,6 @@ async function extractPdfPagesAsImages(tmpPath, originalname) {
         };
       })
     );
-
-    return images;
   } finally {
     await safeRm(tempDir);
   }
@@ -1231,9 +1516,13 @@ function buildUserPromptText({ question, hasAttachments, hasKnowledgeBase }) {
 
   if (hasKnowledgeBase) {
     sections.push(
-      'A base do Notion, se presente mais abaixo, deve ser usada apenas como contexto complementar.'
+      'A base do Notion, se presente mais abaixo, deve ser usada como contexto interno prioritario para procedimentos e regras da empresa.'
     );
   }
+
+  sections.push(
+    'Se a base interna nao responder tudo sozinha, voce pode complementar com busca na Web, deixando explicito o que veio da base interna, o que veio da Web e qual a confiabilidade percebida das fontes externas.'
+  );
 
   return sections.join('\n\n');
 }
@@ -1306,6 +1595,8 @@ function serializeSource(source) {
   return {
     id: source.id,
     rank: source.source_rank,
+    sourceType: source.source_type || '',
+    externalSourceId: source.external_source_id || '',
     title: source.title,
     url: source.url,
     relevanceScore: source.relevance_score,
@@ -1359,12 +1650,14 @@ function buildPersistableSources(pages = []) {
   return pages.map((page) => {
     const topSnippet = page.snippets?.[0];
     return {
+      sourceType: 'notion_page',
       title: page.title,
       url: page.url,
       score: page.score,
       snippetLabel: topSnippet?.label || '',
       snippetText: topSnippet?.text || '',
       metadata: {
+        kind: 'notion',
         snippetCount: page.snippets?.length || 0,
       },
     };
@@ -1586,6 +1879,108 @@ function makeSafeFileName(name = 'arquivo') {
   return value || 'arquivo';
 }
 
+function buildIncomingAttachmentPrefix(userId) {
+  return `incoming/user-${userId}/`;
+}
+
+function normalizeAttachmentUploadRef(rawAttachment = {}) {
+  const size = Number.parseInt(String(rawAttachment?.size ?? rawAttachment?.byteSize ?? '').trim(), 10);
+  return {
+    storagePath: String(rawAttachment?.storagePath || rawAttachment?.url || '').trim(),
+    pathname: String(rawAttachment?.pathname || '').trim(),
+    originalname: normalizeUploadedFileName(
+      rawAttachment?.originalName || rawAttachment?.displayName || rawAttachment?.name || path.basename(String(rawAttachment?.pathname || '').trim()) || 'arquivo'
+    ),
+    mimetype: String(rawAttachment?.mimeType || rawAttachment?.contentType || '').trim(),
+    size: Number.isFinite(size) && size > 0 ? size : 0,
+  };
+}
+
+function parseAttachmentUploadRefs(rawAttachments) {
+  if (!Array.isArray(rawAttachments)) return [];
+  return rawAttachments
+    .map(normalizeAttachmentUploadRef)
+    .filter((attachment) => attachment.storagePath || attachment.pathname);
+}
+
+function assertAttachmentUploadRefAllowed(attachment, userId) {
+  if (!DIRECT_ATTACHMENT_UPLOADS_ENABLED) {
+    throw Object.assign(new Error('Uploads diretos não estão habilitados neste ambiente.'), { statusCode: 503 });
+  }
+
+  const prefix = buildIncomingAttachmentPrefix(userId);
+  if (!attachment.pathname || !attachment.pathname.startsWith(prefix)) {
+    throw Object.assign(new Error('Um dos anexos enviados não pertence ao seu espaço de upload.'), { statusCode: 400 });
+  }
+
+  if (!attachment.storagePath) {
+    throw Object.assign(new Error('Um dos anexos enviados não possui referência de storage.'), { statusCode: 400 });
+  }
+
+  if (attachment.size > MAX_ATTACHMENT_FILE_SIZE) {
+    throw Object.assign(
+      new Error(`Cada arquivo deve ter no máximo ${formatByteSize(MAX_ATTACHMENT_FILE_SIZE)} neste ambiente.`),
+      { statusCode: 413 }
+    );
+  }
+}
+
+async function materializeAttachmentUploadRef(attachment, userId) {
+  assertAttachmentUploadRefAllowed(attachment, userId);
+
+  const extension = path.extname(attachment.originalname || attachment.pathname).toLowerCase();
+  const tempPath = path.join(
+    TEMP_UPLOAD_DIR,
+    `blob-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extension}`
+  );
+  const blobMeta = await downloadPrivateBlobToFile(attachment.storagePath, tempPath);
+  const stat = await fs.promises.stat(tempPath);
+  const byteSize = blobMeta.size ?? attachment.size ?? stat.size;
+
+  if (byteSize > MAX_ATTACHMENT_FILE_SIZE) {
+    await safeUnlink(tempPath);
+    throw Object.assign(
+      new Error(`Cada arquivo deve ter no máximo ${formatByteSize(MAX_ATTACHMENT_FILE_SIZE)} neste ambiente.`),
+      { statusCode: 413 }
+    );
+  }
+
+  return {
+    path: tempPath,
+    originalname: attachment.originalname,
+    mimetype: attachment.mimetype || blobMeta.contentType || '',
+    size: byteSize,
+    storageProvider: PRIVATE_BLOB_STORAGE_PROVIDER,
+    storagePath: attachment.storagePath || blobMeta.url || attachment.pathname,
+    blobPathname: attachment.pathname || blobMeta.pathname || '',
+    uploadedViaDirectBlob: true,
+  };
+}
+
+async function materializeAttachmentUploads(rawAttachments, userId) {
+  const attachments = parseAttachmentUploadRefs(rawAttachments);
+  if (!attachments.length) return [];
+
+  const materialized = [];
+
+  try {
+    for (const attachment of attachments) {
+      materialized.push(await materializeAttachmentUploadRef(attachment, userId));
+    }
+    return materialized;
+  } catch (error) {
+    await cleanupTemporaryRequestFiles(materialized);
+    throw error;
+  }
+}
+
+async function cleanupTemporaryRequestFiles(files = []) {
+  await Promise.all(files
+    .map((file) => file?.path)
+    .filter(Boolean)
+    .map((filePath) => safeUnlink(filePath)));
+}
+
 function formatByteSize(bytes) {
   const value = Number(bytes || 0);
   if (value < 1024 * 1024) {
@@ -1621,7 +2016,7 @@ function assertAttachmentBatchWithinLimit(files = []) {
   if (totalBytes <= MAX_ATTACHMENT_REQUEST_SIZE) return;
 
   throw Object.assign(
-    new Error(`Na Vercel, o total de anexos por envio deve ficar em até ${formatByteSize(MAX_ATTACHMENT_REQUEST_SIZE)}.`),
+    new Error(`O total de anexos por envio deve ficar em até ${formatByteSize(MAX_ATTACHMENT_REQUEST_SIZE)} neste ambiente.`),
     { statusCode: 413 }
   );
 }
@@ -1653,6 +2048,20 @@ async function persistUploadedFileCopy(file, { userId, chatId, messageId }) {
   const baseName = path.basename(originalName, extension);
   const safeBaseName = makeSafeFileName(baseName);
   const checksumSha256 = await sha256ForFile(file.path);
+
+  if (isBlobStorageProvider(file.storageProvider) && file.storagePath) {
+    return {
+      displayName: originalName,
+      originalName,
+      mimeType: file.mimetype,
+      fileExtension: extension || null,
+      byteSize: file.size || null,
+      checksumSha256,
+      storageProvider: PRIVATE_BLOB_STORAGE_PROVIDER,
+      storagePath: file.storagePath,
+      publicUrl: null,
+    };
+  }
 
   if (USE_BLOB_STORAGE) {
     assertPersistentFileStorageConfigured();
@@ -1882,6 +2291,40 @@ app.get('/api/auth/me', (req, res) => {
   }
 
   return res.json({ user: req.auth.user });
+});
+
+app.post('/api/blob/upload', requireAuth, async (req, res) => {
+  if (!DIRECT_ATTACHMENT_UPLOADS_ENABLED) {
+    return res.status(503).json({ error: 'Uploads diretos não estão habilitados neste ambiente.' });
+  }
+
+  try {
+    const result = await handleUpload({
+      request: req,
+      body: req.body,
+      onBeforeGenerateToken: async (pathname) => {
+        const normalizedPathname = String(pathname || '').trim();
+        const allowedPrefix = buildIncomingAttachmentPrefix(req.auth.user.id);
+
+        if (!normalizedPathname.startsWith(allowedPrefix)) {
+          throw Object.assign(new Error('O caminho de upload informado é inválido para este usuário.'), { statusCode: 400 });
+        }
+
+        return {
+          addRandomSuffix: true,
+          maximumSizeInBytes: MAX_ATTACHMENT_FILE_SIZE,
+          allowedContentTypes: ['application/*', 'image/*', 'text/*'],
+          validUntil: Date.now() + (60 * 60 * 1000),
+        };
+      },
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error?.statusCode || error?.status || 400).json({
+      error: error?.message || 'Não foi possível preparar o upload do anexo.',
+    });
+  }
 });
 
 app.get('/api/auth/google', googleAuthRateLimiter, (req, res) => {
@@ -2289,45 +2732,138 @@ app.post('/api/messages/:messageId/feedback', requireAuth, feedbackRateLimiter, 
   }
 });
 
-const OPENAI_MODEL = 'gpt-4o';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
 const SYSTEM_PROMPT = `Você é o SmartAI, assistente de suporte interno da Smart Leilões, atuando no segmento Smart Caixa.
 
 Se te perguntarem quem foi André Prado, responda dizendo 'Grande Amigo do Davi Tigela - Sistemas'.
 
-Seu papel é esclarecer dúvidas dos colaboradores com profundidade e detalhamento. Ao responder, antecipe dúvidas relacionadas, possíveis contra-argumentos e cenários alternativos — tudo numa única mensagem completa, por mais longa que seja. Prefira sempre a resposta mais completa possível. Se o usuário pedir objetividade, seja mais direto, mas mantenha a precisão e o profissionalismo.
+Seu papel é esclarecer dúvidas dos colaboradores com profundidade e detalhamento. Sua função principal é ENSINAR COMO EXECUTAR, e não apenas definir conceitos. Ao responder, explique o passo a passo, ordem de execução, pré-requisitos, documentos, validações, regras internas, riscos, erros comuns e checklist final. Se o usuário pedir objetividade, seja mais direto, mas mantenha precisão e utilidade prática.
 
 REGRAS DE COMPORTAMENTO:
-- Responda SOMENTE com base na documentação interna fornecida no contexto. Ela é sua única fonte de verdade.
 - Quando houver arquivos anexados nesta conversa, trate-os como prioridade maxima. Analise primeiro os anexos e so depois use o Notion como contexto complementar.
 - Nao confunda arquivos anexados nesta conversa com paginas ou documentos da base do Notion.
 - Os documentos chegam como trechos extraídos do Notion. Trate cada trecho como conteúdo literal da página indicada pelo título e pela seção.
 - Se houver múltiplos trechos do mesmo documento, combine as informações antes de decidir que faltam dados.
-- Nunca invente, suponha, complete lacunas com suposições ou recorra a conhecimento externo. Se não está na documentação, não está na resposta.
+- A base interna do Notion é a fonte prioritária para procedimentos, regras e orientações da empresa.
+- Voce PODE consultar a Web quando a base interna nao trouxer informação suficiente, quando o contexto exigir complementação externa, ou quando houver necessidade de validar contexto geral do assunto. Use a Web como complemento, nunca para sobrepor regra interna da empresa.
+- Nunca invente, suponha ou complete lacunas sem deixar claro o que veio do Notion, o que veio da Web e o que nao foi encontrado.
 - Sempre que citar uma informação, identifique o nome real da página/documento do Notion (ex: "conforme a página Política de Reembolso"). Nunca use rótulos como Doc 1, Doc 2 ou similares.
 - Se o usuario perguntar sobre um arquivo anexado e ele nao puder ser lido, diga claramente que nao foi possivel analisar o anexo. Nao responda como se o arquivo tivesse sido compreendido.
-- Só use a frase de indisponibilidade quando nenhum trecho fornecido abordar a pergunta.
-- Se a mensagem enviada pelo usuário possuir algum erro de digitação, apresente sugestões baseadas em tópicos sobre o que ele poderia estar se referindo. Porém, se a informação solicitada não constar em nenhum documento disponível, responda exatamente: "Não encontrei essa informação na base de conhecimento interna. Tente contatar o responsável pela área ou o setor de Sistemas." Não adicione suposições após essa frase.
+- Se a mensagem enviada pelo usuário possuir algum erro de digitação, apresente sugestões baseadas em tópicos sobre o que ele poderia estar se referindo.
+- Nao se recuse a atender apenas porque a pergunta veio com erro de digitação, sigla errada, abreviação incomum ou gramática ruim. Interprete o contexto, corrija mentalmente o que for preciso e siga ajudando.
+- Se a base interna nao trouxer a informação exata, diga isso explicitamente. Se houver fontes externas úteis, apresente-as como complemento e deixe claro que sao externas.
+- Se houver divergencia entre Notion e Web, destaque a divergencia com clareza, mantenha a regra interna como prioridade para procedimento da empresa e oriente o colaborador a contatar seu tutor, lider ou o setor responsável antes de executar.
+- Se o Notion nao tiver informação suficiente, mas a Web tiver contexto útil, monte um pequeno relatório comparando o que foi encontrado internamente e externamente e finalize orientando o colaborador a contatar seu tutor/lider.
+- Se existirem variacoes importantes de procedimento por contexto (ex: pre ou pos-arrematacao) e o usuário nao informar qual cenário se aplica, faca uma pergunta curta de esclarecimento antes do passo a passo final. Se ainda assim decidir responder, separe claramente os cenários e nunca misture fluxos distintos.
+- Quando o usuário trouxer prints, telas, comprovantes, contratos, notas devolutivas ou outros anexos visuais, interprete o material e use isso para orientar o assessor, inclusive sugerindo como responder o cliente quando fizer sentido.
 - Responda sempre em português, com linguagem profissional e acessível.
-- Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou "1., 2., 3., ..." para listas e "**destaque**" para pontos importantes.
-- Evite usar "###", tabelas, excesso de formatação ou estilos incomuns.
-- Em respostas longas, use subtítulos, listas e estrutura clara para facilitar a leitura.`;
+- Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou listas numeradas sequenciais para passos, e "**destaque**" para pontos importantes.
+- Nao use "###", "####", tabelas ou estilos incomuns.
+- Em respostas longas, priorize esta estrutura quando fizer sentido: "## Entendimento", "## Como fazer", "## Regras internas", "## Fontes e confiabilidade", "## Quando escalar".
+- Na seção de fontes e confiabilidade, deixe claro:
+  - o que veio do Notion;
+  - o que veio da Web;
+  - a confiabilidade percebida das fontes externas (alta, media ou baixa) e por quê.
+- Quando houver fontes externas, diga explicitamente que os links completos estao listados nas fontes relacionadas da resposta.`;
 
 function buildOpenAiPayload(messages) {
-  return {
+  const payload = {
     model: OPENAI_MODEL,
-    max_tokens: 5632,
-    messages: [
-      {
-        role: 'system',
-        content: SYSTEM_PROMPT,
-      },
-      ...messages,
-    ],
+    instructions: SYSTEM_PROMPT,
+    input: messages,
+    max_output_tokens: MAX_MODEL_OUTPUT_TOKENS,
+    temperature: 0.2,
+    truncation: 'auto',
   };
+
+  if (ENABLE_WEB_SEARCH) {
+    payload.tools = [WEB_SEARCH_TOOL];
+    payload.tool_choice = 'auto';
+    payload.parallel_tool_calls = true;
+  }
+
+  return payload;
 }
 
 function getSourcesFromPages(pages) {
-  return pages.map((page) => ({ title: page.title, url: page.url, score: page.score }));
+  return pages.map((page) => ({
+    sourceType: 'notion_page',
+    title: page.title,
+    url: page.url,
+    score: page.score,
+    metadata: {
+      kind: 'notion',
+    },
+  }));
+}
+
+function buildPersistableWebSources(webSources = []) {
+  return webSources.map((source) => ({
+    sourceType: 'web_url',
+    title: source.title,
+    url: source.url,
+    metadata: {
+      ...(source.metadata || {}),
+      kind: 'web',
+    },
+  }));
+}
+
+function mergeAssistantSources(...groups) {
+  const merged = [];
+  const seen = new Set();
+
+  groups.flat().filter(Boolean).forEach((source) => {
+    const key = `${source.sourceType || ''}|${source.url || ''}|${source.title || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push({
+      ...source,
+      metadata: { ...(source.metadata || {}) },
+    });
+  });
+
+  return merged;
+}
+
+function extractResponseAnswerAndWebSources(response) {
+  const answerParts = [];
+  const webSourceMap = new Map();
+
+  for (const item of response?.output || []) {
+    if (item?.type !== 'message' || item.role !== 'assistant') continue;
+
+    for (const part of item.content || []) {
+      if (part?.type === 'output_text') {
+        if (part.text) {
+          answerParts.push(part.text);
+        }
+
+        for (const annotation of part.annotations || []) {
+          if (annotation?.type !== 'url_citation' || !annotation.url) continue;
+          const key = `${annotation.url}|${annotation.title || ''}`;
+          if (webSourceMap.has(key)) continue;
+          webSourceMap.set(key, {
+            sourceType: 'web_url',
+            title: annotation.title || annotation.url,
+            url: annotation.url,
+            metadata: {
+              kind: 'web',
+            },
+          });
+        }
+      }
+
+      if (part?.type === 'refusal' && part.refusal) {
+        answerParts.push(part.refusal);
+      }
+    }
+  }
+
+  return {
+    answer: answerParts.join('\n\n').trim(),
+    webSources: Array.from(webSourceMap.values()),
+  };
 }
 
 function createRequestId() {
@@ -2336,7 +2872,7 @@ function createRequestId() {
 
 function sanitizePayloadForLog(payload) {
   return JSON.parse(JSON.stringify(payload, (key, value) => {
-    if (key === 'url' && typeof value === 'string' && value.startsWith('data:')) {
+    if ((key === 'url' || key === 'image_url' || key === 'file_data') && typeof value === 'string' && value.startsWith('data:')) {
       return `[data-url omitted; ${value.length} chars]`;
     }
 
@@ -2457,14 +2993,39 @@ function getMessageText(content) {
   return '';
 }
 
-function getDeltaTextFromChunk(chunk) {
-  return getMessageText(chunk?.choices?.[0]?.delta?.content);
+function sanitizeAssistantMarkdown(text) {
+  if (!text) return '';
+
+  const collapsedListSpacing = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/^(#{4,})\s+/gm, '## ')
+    .replace(/(^\d+\.\s[^\n]+)\n{2,}(?=\d+\.\s)/gm, '$1\n')
+    .replace(/(^[-*]\s[^\n]+)\n{2,}(?=[-*]\s)/gm, '$1\n');
+
+  const lines = collapsedListSpacing.split('\n');
+  let orderedIndex = 0;
+
+  const normalized = lines.map((line) => {
+    const orderedMatch = /^(\s*)\d+\.\s+(.+)$/.exec(line);
+    if (orderedMatch) {
+      orderedIndex += 1;
+      return `${orderedMatch[1]}${orderedIndex}. ${orderedMatch[2]}`;
+    }
+
+    if (line.trim()) {
+      orderedIndex = 0;
+    }
+
+    return line;
+  }).join('\n');
+
+  return normalizeExtractedText(normalized, MAX_MODEL_OUTPUT_TOKENS * 6);
 }
 
 /* ═══════════════════════════════════════════════
    ROTA PRINCIPAL  POST /api/ask
 ═══════════════════════════════════════════════ */
-app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), async (req, res) => {
+app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTACHMENT_FILES), async (req, res) => {
   const requestId = createRequestId();
   const requestStartedAt = Date.now();
   const wantsStream = req.get('x-response-mode') === 'stream';
@@ -2473,9 +3034,12 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
   let history = [];
   let chatId = null;
   let notionMetrics = null;
+  let uploadedAttachmentRefs = [];
+  let files = req.files || [];
 
   if (req.is('application/json')) {
     ({ question, history = [], chatId } = req.body);
+    uploadedAttachmentRefs = req.body?.attachments || req.body?.attachmentUploads || [];
     history = sanitizeHistory(history);
   } else {
     question = req.body.question;
@@ -2483,21 +3047,22 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
     history = parseHistoryField(req.body.history);
   }
 
-  const files = req.files || [];
   try {
+    if (!files.length && req.is('application/json') && uploadedAttachmentRefs.length) {
+      files = await stageTimer.measure('downloadUploadedFiles', async () => (
+        materializeAttachmentUploads(uploadedAttachmentRefs, req.auth.user.id)
+      ));
+    }
+
     assertAttachmentBatchWithinLimit(files);
-  } catch (error) {
-    return res.status(error.statusCode || 400).json({ error: error.message });
-  }
 
-  if (!question && files.length === 0) {
-    return res.status(400).json({ error: 'Envie uma pergunta ou arquivo.' });
-  }
+    if (!question && files.length === 0) {
+      return res.status(400).json({ error: 'Envie uma pergunta ou arquivo.' });
+    }
 
-  const displayQuestion = normalizeQuery(question || '');
-  question = displayQuestion || '(sem texto - analise os arquivos anexados)';
+    const displayQuestion = normalizeQuery(question || '');
+    question = displayQuestion || '(sem texto - analise os arquivos anexados)';
 
-  try {
     const requestedChatId = parsePositiveInt(chatId);
     let chat = null;
 
@@ -2600,57 +3165,78 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
       hasAttachments: files.length > 0,
       hasKnowledgeBase: Boolean(context),
     });
-    userContentParts.push({ type: 'text', text: textBlock });
+    userContentParts.push({ type: 'input_text', text: textBlock });
 
     extracted.filter((f) => f.type === 'text').forEach((f) => {
       userContentParts.push({
-        type: 'text',
+        type: 'input_text',
         text: `\n\n[Arquivo anexado nesta conversa: ${f.name}]\nConteudo extraido:\n${f.content}`,
       });
     });
 
     extracted.filter((f) => f.type === 'image').forEach((f) => {
       userContentParts.push({
-        type: 'image_url',
-        image_url: { url: `data:${f.mime};base64,${f.base64}`, detail: 'high' },
+        type: 'input_image',
+        image_url: `data:${f.mime};base64,${f.base64}`,
+        detail: 'high',
       });
-      userContentParts.push({ type: 'text', text: `[Imagem anexada nesta conversa: ${f.name}]` });
+      userContentParts.push({ type: 'input_text', text: `[Imagem anexada nesta conversa: ${f.name}]` });
     });
 
     extracted.filter((f) => f.type === 'pdf_images').forEach((f) => {
       userContentParts.push({
-        type: 'text',
+        type: 'input_text',
         text: `[PDF anexado nesta conversa: ${f.name}] O PDF foi convertido em imagens para analise visual.`,
       });
       f.images.forEach((image) => {
         userContentParts.push({
-          type: 'image_url',
-          image_url: { url: `data:${image.mime};base64,${image.base64}`, detail: 'high' },
+          type: 'input_image',
+          image_url: `data:${image.mime};base64,${image.base64}`,
+          detail: 'high',
         });
-        userContentParts.push({ type: 'text', text: `[Pagina do PDF anexado: ${image.name}]` });
+        userContentParts.push({ type: 'input_text', text: `[Pagina do PDF anexado: ${image.name}]` });
       });
     });
 
+    if (fileIssues.length) {
+      userContentParts.push({
+        type: 'input_text',
+        text: `[Arquivos com falha de leitura]\n${fileIssues.map((item) => `- ${item.name}: ${item.reason}`).join('\n')}`,
+      });
+    }
+
+    if (unsupported.length) {
+      userContentParts.push({
+        type: 'input_text',
+        text: `[Arquivos com formato nao suportado]\n${unsupported.map((name) => `- ${name}`).join('\n')}`,
+      });
+    }
+
     if (context) {
       userContentParts.push({
-        type: 'text',
+        type: 'input_text',
         text: `\n\n[Base de conhecimento do Notion - contexto complementar]\n${context}`,
       });
     }
 
-    const { messages, sources, persistableSources, openAiPayload } = stageTimer.measureSync('buildPrompt', () => {
+    const {
+      messages,
+      notionSources,
+      notionPersistableSources,
+      openAiPayload,
+    } = stageTimer.measureSync('buildPrompt', () => {
       const nextMessages = [
         ...history.map((m) => ({ role: m.role, content: m.content })),
         {
           role: 'user',
-          content: userContentParts.length === 1 ? userContentParts[0].text : userContentParts,
+          content: userContentParts,
         },
       ];
 
       return {
         messages: nextMessages,
-        sources: getSourcesFromPages(pages),
-        persistableSources: buildPersistableSources(pages),
+        notionSources: getSourcesFromPages(pages),
+        notionPersistableSources: buildPersistableSources(pages),
         openAiPayload: buildOpenAiPayload(nextMessages),
       };
     });
@@ -2661,7 +3247,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
       history,
       context,
       pages,
-      sources,
+      sources: notionSources,
       unsupported,
       fileIssues,
       extracted,
@@ -2677,7 +3263,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
           requestId,
           chatId: chat.id,
           userMessageId: userMessage.id,
-          sources,
+          sources: notionSources,
           unsupported,
           fileIssues,
         },
@@ -2687,33 +3273,58 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
       let firstTokenAt = null;
       let chunkCount = 0;
       let answer = '';
+      let finalResponse = null;
 
-      const stream = await openai.chat.completions.create({
+      const stream = await openai.responses.create({
         ...openAiPayload,
         stream: true,
       });
 
-      for await (const chunk of stream) {
-        const delta = getDeltaTextFromChunk(chunk);
-        if (!delta) continue;
+      for await (const event of stream) {
+        if (event.type === 'response.completed') {
+          finalResponse = event.response;
+          continue;
+        }
+
+        if (event.type === 'response.failed') {
+          throw new Error('A resposta do modelo falhou antes de ser concluida.');
+        }
+
+        if (event.type === 'error') {
+          throw new Error(event.message || 'Erro ao gerar a resposta.');
+        }
+
+        if (event.type !== 'response.output_text.delta' || !event.delta) {
+          continue;
+        }
 
         if (!firstTokenAt) {
           firstTokenAt = Date.now();
         }
 
         chunkCount += 1;
-        answer += delta;
-        console.log(`[SmartAI][${requestId}] chunk ${chunkCount}:`, JSON.stringify(delta));
-        writeStreamEvent(res, { type: 'chunk', delta });
+        answer += event.delta;
+        console.log(`[SmartAI][${requestId}] chunk ${chunkCount}:`, JSON.stringify(event.delta));
+        writeStreamEvent(res, { type: 'chunk', delta: event.delta });
       }
 
+      const extractedResponse = extractResponseAnswerAndWebSources(finalResponse);
+      const finalAnswer = sanitizeAssistantMarkdown(extractedResponse.answer || answer);
+      const sources = mergeAssistantSources(
+        notionSources,
+        extractedResponse.webSources
+      );
+      const persistableSources = mergeAssistantSources(
+        notionPersistableSources,
+        buildPersistableWebSources(extractedResponse.webSources)
+      );
       const totalMs = Date.now() - requestStartedAt;
       const aiMs = Date.now() - aiStartedAt;
       const firstTokenMs = firstTokenAt ? firstTokenAt - aiStartedAt : null;
       const stageTimings = stageTimer.snapshot();
       stageTimings.openAi = aiMs;
       const payload = {
-        answer,
+        answer: finalAnswer,
         requestId,
         chatId: chat.id,
         userMessageId: userMessage.id,
@@ -2735,7 +3346,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
           chatId: chat.id,
           authorUserId: null,
           role: 'assistant',
-          contentText: answer,
+          contentText: finalAnswer,
           contentFormat: 'markdown',
           requestId,
           modelName: OPENAI_MODEL,
@@ -2766,7 +3377,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
       logStageMetrics(requestId, payload.timings.stages, notionMetrics);
       logResponseDebug({
         requestId,
-        answer,
+        answer: finalAnswer,
         sources,
         totalMs,
         aiMs,
@@ -2779,8 +3390,14 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
     }
 
     const aiStartedAt = Date.now();
-    const response = await openai.chat.completions.create(openAiPayload);
-    const answer = getMessageText(response.choices[0]?.message?.content);
+    const response = await openai.responses.create(openAiPayload);
+    const extractedResponse = extractResponseAnswerAndWebSources(response);
+    const answer = sanitizeAssistantMarkdown(extractedResponse.answer);
+    const sources = mergeAssistantSources(notionSources, extractedResponse.webSources);
+    const persistableSources = mergeAssistantSources(
+      notionPersistableSources,
+      buildPersistableWebSources(extractedResponse.webSources)
+    );
     const totalMs = Date.now() - requestStartedAt;
     const aiMs = Date.now() - aiStartedAt;
     const stageTimings = stageTimer.snapshot();
@@ -2862,6 +3479,8 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', 5), asyn
     }
 
     res.status(err?.statusCode || 500).json({ error: errorMessage });
+  } finally {
+    await cleanupTemporaryRequestFiles(files);
   }
 });
 
@@ -2869,7 +3488,7 @@ app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({
-        error: `Cada arquivo deve ter no máximo ${formatByteSize(MAX_UPLOAD_FILE_SIZE)} neste ambiente.`,
+        error: `Cada arquivo deve ter no máximo ${formatByteSize(MAX_MULTIPART_FILE_SIZE)} neste ambiente.`,
       });
     }
 
