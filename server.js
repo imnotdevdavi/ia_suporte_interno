@@ -1358,29 +1358,14 @@ async function extractFileContent(file) {
     }
 
     if (mimetype === 'application/pdf' || extension === '.pdf') {
-      const content = await extractPdfText(tmpPath);
-      if (!content) {
-        const pages = await extractPdfPagesAsImages(tmpPath, originalname);
-        if (pages.length) {
-          console.log(`[SmartAI][arquivo] ${originalname}: PDF sem texto embutido, convertido em ${pages.length} imagem(ns).`);
-          return {
-            type: 'pdf_images',
-            name: originalname,
-            images: pages,
-            reason: 'PDF convertido em imagens para analise visual.',
-          };
-        }
-
-        return {
-          type: 'error',
-          name: originalname,
-          reason: isVercelRuntime()
-            ? 'O PDF nao retornou texto legivel e a conversao visual falhou neste ambiente. Se ele for escaneado, tente reenviar uma versao pesquisavel.'
-            : 'O PDF nao retornou texto legivel nem imagens utilizaveis. Se ele for escaneado, pode precisar de OCR.',
-        };
-      }
-      console.log(`[SmartAI][arquivo] ${originalname}: PDF lido como texto.`);
-      return { type: 'text', content, name: originalname };
+      const data = await fs.promises.readFile(tmpPath, { encoding: 'base64' });
+      console.log(`[SmartAI][arquivo] ${originalname}: PDF encaminhado ao modelo como arquivo nativo.`);
+      return {
+        type: 'pdf_file',
+        base64: data,
+        mime: 'application/pdf',
+        name: originalname,
+      };
     }
 
     if (mimetype === DOCX_MIME || extension === '.docx') {
@@ -1624,7 +1609,7 @@ async function safeRm(filePath) {
 }
 
 function isReadableExtractedFile(file) {
-  return ['text', 'image', 'pdf_images'].includes(file?.type);
+  return ['text', 'image', 'pdf_images', 'pdf_file'].includes(file?.type);
 }
 
 function buildAttachmentSearchText(extracted = []) {
@@ -1633,7 +1618,7 @@ function buildAttachmentSearchText(extracted = []) {
       return [`${file.name} ${file.content.slice(0, 500)}`];
     }
 
-    if (file.type === 'pdf_images' || file.type === 'image') {
+    if (file.type === 'pdf_images' || file.type === 'image' || file.type === 'pdf_file') {
       return [file.name];
     }
 
@@ -2291,6 +2276,9 @@ function buildAttachmentPersistencePayload(file, storedFile, extractedFile) {
     extractedText = extractedFile.content || null;
   } else if (extractedFile?.type === 'image') {
     extractedMetadata.imageMime = extractedFile.mime || null;
+  } else if (extractedFile?.type === 'pdf_file') {
+    extractedMetadata.fileMime = extractedFile.mime || 'application/pdf';
+    extractedMetadata.processingMethod = 'openai_input_file';
   } else if (extractedFile?.type === 'pdf_images') {
     extractedMetadata.reason = extractedFile.reason || null;
     extractedMetadata.derivedImageCount = Array.isArray(extractedFile.images) ? extractedFile.images.length : 0;
@@ -3145,7 +3133,11 @@ function createRequestId() {
 
 function sanitizePayloadForLog(payload) {
   return JSON.parse(JSON.stringify(payload, (key, value) => {
-    if ((key === 'url' || key === 'image_url' || key === 'file_data') && typeof value === 'string' && value.startsWith('data:')) {
+    if (key === 'file_data' && typeof value === 'string') {
+      return `[file-data omitted; ${value.length} chars]`;
+    }
+
+    if ((key === 'url' || key === 'image_url') && typeof value === 'string' && value.startsWith('data:')) {
       return `[data-url omitted; ${value.length} chars]`;
     }
 
@@ -3577,6 +3569,18 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
           detail: 'high',
         });
         userContentParts.push({ type: 'input_text', text: `[Pagina do PDF anexado: ${image.name}]` });
+      });
+    });
+
+    extracted.filter((f) => f.type === 'pdf_file').forEach((f) => {
+      userContentParts.push({
+        type: 'input_file',
+        filename: f.name,
+        file_data: f.base64,
+      });
+      userContentParts.push({
+        type: 'input_text',
+        text: `[PDF anexado nesta conversa: ${f.name}] Analise este PDF diretamente, considerando o texto e as imagens de cada pagina.`,
       });
     });
 
