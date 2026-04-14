@@ -1358,11 +1358,10 @@ async function extractFileContent(file) {
     }
 
     if (mimetype === 'application/pdf' || extension === '.pdf') {
-      const data = await fs.promises.readFile(tmpPath, { encoding: 'base64' });
-      console.log(`[SmartAI][arquivo] ${originalname}: PDF encaminhado ao modelo como arquivo nativo.`);
+      console.log(`[SmartAI][arquivo] ${originalname}: PDF preparado para envio nativo ao modelo.`);
       return {
         type: 'pdf_file',
-        base64: data,
+        path: tmpPath,
         mime: 'application/pdf',
         name: originalname,
       };
@@ -2278,7 +2277,7 @@ function buildAttachmentPersistencePayload(file, storedFile, extractedFile) {
     extractedMetadata.imageMime = extractedFile.mime || null;
   } else if (extractedFile?.type === 'pdf_file') {
     extractedMetadata.fileMime = extractedFile.mime || 'application/pdf';
-    extractedMetadata.processingMethod = 'openai_input_file';
+    extractedMetadata.processingMethod = 'openai_file_id';
   } else if (extractedFile?.type === 'pdf_images') {
     extractedMetadata.reason = extractedFile.reason || null;
     extractedMetadata.derivedImageCount = Array.isArray(extractedFile.images) ? extractedFile.images.length : 0;
@@ -2944,7 +2943,8 @@ REGRAS DE COMPORTAMENTO:
   - a confiabilidade percebida das fontes externas (alta, media ou baixa) e por quê.
 - Quando houver fontes externas, diga explicitamente que os links completos estao listados nas fontes relacionadas da resposta.`;
 
-function buildOpenAiPayload(messages) {
+function buildOpenAiPayload(messages, options = {}) {
+  const enableWebSearch = options.enableWebSearch !== false && ENABLE_WEB_SEARCH;
   const payload = {
     model: OPENAI_MODEL,
     instructions: SYSTEM_PROMPT,
@@ -2954,7 +2954,7 @@ function buildOpenAiPayload(messages) {
     truncation: 'auto',
   };
 
-  if (ENABLE_WEB_SEARCH) {
+  if (enableWebSearch) {
     payload.tools = [WEB_SEARCH_TOOL];
     payload.tool_choice = 'auto';
     payload.parallel_tool_calls = true;
@@ -3145,6 +3145,60 @@ function sanitizePayloadForLog(payload) {
   }));
 }
 
+async function uploadPdfFileForModel(tmpPath, originalname, requestId = '') {
+  const uploaded = await openai.files.create({
+    file: fs.createReadStream(tmpPath),
+    purpose: 'user_data',
+  });
+
+  if (uploaded?.id && uploaded?.status && uploaded.status !== 'processed') {
+    await openai.files.waitForProcessing(uploaded.id, {
+      pollInterval: 500,
+      maxWait: 30 * 1000,
+    });
+  }
+
+  console.log(`[SmartAI][${requestId || 'arquivo'}] PDF enviado para a Files API da OpenAI: ${originalname} -> ${uploaded.id}`);
+  return uploaded.id;
+}
+
+async function cleanupOpenAiFiles(fileIds = [], requestId = '') {
+  const uniqueIds = [...new Set(fileIds.filter(Boolean))];
+  if (!uniqueIds.length) return;
+
+  await Promise.allSettled(uniqueIds.map(async (fileId) => {
+    try {
+      await openai.files.del(fileId);
+    } catch (error) {
+      console.warn(`[SmartAI][${requestId || 'cleanup'}] Falha ao excluir arquivo temporario da OpenAI (${fileId}):`, error?.message || error);
+    }
+  }));
+}
+
+function resolveRequestErrorStatus(error) {
+  if (error?.statusCode) return error.statusCode;
+  if (typeof error?.status === 'number') {
+    return error.status >= 500 ? 502 : 422;
+  }
+  return 500;
+}
+
+function resolveRequestErrorMessage(error) {
+  if (error?.statusCode && error?.message) {
+    return error.message;
+  }
+
+  if (typeof error?.status === 'number') {
+    const providerMessage = error?.error?.message || error?.message;
+    if (providerMessage) {
+      return `Falha ao processar com o provedor de IA: ${providerMessage}`;
+    }
+    return 'Falha ao processar o anexo com o provedor de IA.';
+  }
+
+  return 'Erro interno ao processar a pergunta.';
+}
+
 function buildPagesDebug(pages) {
   return pages.map((page) => ({
     title: page.title,
@@ -3302,6 +3356,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
   let userMessage = null;
   let notionMetrics = null;
   let uploadedAttachmentRefs = [];
+  let uploadedModelFileIds = [];
   let files = req.files || [];
 
   if (req.is('application/json')) {
@@ -3572,11 +3627,30 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       });
     });
 
-    extracted.filter((f) => f.type === 'pdf_file').forEach((f) => {
+    const extractedForPrompt = extracted.some((f) => f.type === 'pdf_file')
+      ? await stageTimer.measure('uploadPdfInputs', async () => {
+        const pdfFileIdByPath = new Map();
+
+        await Promise.all(extracted
+          .filter((f) => f.type === 'pdf_file')
+          .map(async (f) => {
+            const fileId = await uploadPdfFileForModel(f.path, f.name, requestId);
+            uploadedModelFileIds.push(fileId);
+            pdfFileIdByPath.set(f.path, fileId);
+          }));
+
+        return extracted.map((f) => (
+          f.type === 'pdf_file'
+            ? { ...f, fileId: pdfFileIdByPath.get(f.path) || null }
+            : f
+        ));
+      })
+      : extracted;
+
+    extractedForPrompt.filter((f) => f.type === 'pdf_file').forEach((f) => {
       userContentParts.push({
         type: 'input_file',
-        filename: f.name,
-        file_data: f.base64,
+        file_id: f.fileId,
       });
       userContentParts.push({
         type: 'input_text',
@@ -3615,7 +3689,9 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       ];
 
       return {
-        openAiPayload: buildOpenAiPayload(nextMessages),
+        openAiPayload: buildOpenAiPayload(nextMessages, {
+          enableWebSearch: files.length === 0,
+        }),
       };
     });
 
@@ -3875,7 +3951,8 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
   } catch (err) {
     console.error(`[SmartAI][${requestId}] Erro ao processar requisicao:`, err);
     logStageMetrics(requestId, stageTimer.snapshot(), notionMetrics);
-    const errorMessage = err?.statusCode ? err.message : 'Erro interno ao processar a pergunta.';
+    const errorMessage = resolveRequestErrorMessage(err);
+    const errorStatus = resolveRequestErrorStatus(err);
 
     if (wantsStream && res.headersSent) {
       writeStreamEvent(res, {
@@ -3890,8 +3967,9 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       return res.end();
     }
 
-    res.status(err?.statusCode || 500).json({ error: errorMessage });
+    res.status(errorStatus).json({ error: errorMessage });
   } finally {
+    await cleanupOpenAiFiles(uploadedModelFileIds, requestId);
     await cleanupTemporaryRequestFiles(files);
   }
 });
