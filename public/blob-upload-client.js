@@ -1,3 +1,1 @@
-export async function upload() {
-  throw new Error('Upload direto não está disponível neste build.');
-}
+export { upload } from '@vercel/blob/client';

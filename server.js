@@ -70,6 +70,7 @@ import {
   softDeleteChatForUser,
   touchSession,
   touchUserLastLogin,
+  updateChatTitle,
   updateChatTitleIfDefault,
   updateUserPassword,
   updateUserProfile,
@@ -304,6 +305,8 @@ const MAX_FILE_CHARS = 12000;
 const MAX_PDF_IMAGE_PAGES = 4;
 const PDF_IMAGE_DPI = 144;
 const PDF_IMAGE_DESIRED_WIDTH = 1440;
+const DEFAULT_CHAT_TITLE = 'Novo chat';
+const MAX_CHAT_TITLE_CHARS = 96;
 const notionSearchCache = createAsyncExpiringCache({
   ttlMs: NOTION_SEARCH_CACHE_TTL_MS,
   maxEntries: NOTION_SEARCH_CACHE_MAX_ENTRIES,
@@ -1371,7 +1374,9 @@ async function extractFileContent(file) {
         return {
           type: 'error',
           name: originalname,
-          reason: 'O PDF nao retornou texto legivel nem imagens utilizaveis. Se ele for escaneado, pode precisar de OCR.',
+          reason: isVercelRuntime()
+            ? 'O PDF nao retornou texto legivel e a conversao visual falhou neste ambiente. Se ele for escaneado, tente reenviar uma versao pesquisavel.'
+            : 'O PDF nao retornou texto legivel nem imagens utilizaveis. Se ele for escaneado, pode precisar de OCR.',
         };
       }
       console.log(`[SmartAI][arquivo] ${originalname}: PDF lido como texto.`);
@@ -1476,7 +1481,9 @@ async function extractPdfText(tmpPath) {
         await parser.destroy().catch(() => {});
       }
     }
-  } catch {}
+  } catch (error) {
+    console.warn('Falha ao extrair texto de PDF via pdf-parse:', error?.message || error);
+  }
 
   try {
     const { stdout } = await execFileAsync('pdftotext', ['-layout', tmpPath, '-'], {
@@ -1485,7 +1492,9 @@ async function extractPdfText(tmpPath) {
     });
     const fallbackText = normalizeExtractedText(stdout, MAX_FILE_CHARS);
     if (fallbackText) return fallbackText;
-  } catch {}
+  } catch (error) {
+    console.warn('Falha ao extrair texto de PDF via pdftotext:', error?.message || error);
+  }
 
   return '';
 }
@@ -1531,7 +1540,9 @@ async function extractPdfPagesAsImages(tmpPath, originalname) {
         await parser.destroy().catch(() => {});
       }
     }
-  } catch {}
+  } catch (error) {
+    console.warn('Falha ao converter PDF em imagens via pdf-parse:', error?.message || error);
+  }
 
   const tempDir = await fs.promises.mkdtemp(path.join(TEMP_UPLOAD_DIR, 'pdf-pages-'));
   const outputPrefix = path.join(tempDir, 'page');
@@ -1564,6 +1575,9 @@ async function extractPdfPagesAsImages(tmpPath, originalname) {
         };
       })
     );
+  } catch (error) {
+    console.warn('Falha ao converter PDF em imagens via pdftoppm:', error?.message || error);
+    return [];
   } finally {
     await safeRm(tempDir);
   }
@@ -2156,20 +2170,33 @@ function assertAttachmentBatchWithinLimit(files = []) {
   );
 }
 
+function normalizeChatTitle(value = '', fallback = DEFAULT_CHAT_TITLE) {
+  const normalized = normalizeQuery(String(value || '')
+    .replace(/^t[ií]tulo:\s*/i, '')
+    .replace(/["'`“”]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  )
+    .replace(/[.!?]+$/g, '')
+    .slice(0, MAX_CHAT_TITLE_CHARS);
+
+  return normalized || fallback;
+}
+
 function buildChatTitleFromInput(question, files = []) {
   const normalizedQuestion = normalizeQuery(question || '');
   if (normalizedQuestion) {
-    return normalizedQuestion.slice(0, 80);
+    return normalizeChatTitle(normalizedQuestion);
   }
 
   if (files.length) {
-    return files
+    return normalizeChatTitle(files
       .map((file) => normalizeUploadedFileName(file.originalname))
       .join(', ')
-      .slice(0, 80) || 'Novo chat';
+      || DEFAULT_CHAT_TITLE);
   }
 
-  return 'Novo chat';
+  return DEFAULT_CHAT_TITLE;
 }
 
 async function sha256ForFile(filePath) {
@@ -2888,6 +2915,12 @@ app.post('/api/messages/:messageId/feedback', requireAuth, feedbackRateLimiter, 
 });
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+const CHAT_TITLE_MODEL = process.env.OPENAI_TITLE_MODEL || OPENAI_MODEL;
+const CHAT_TITLE_PROMPT = `Você gera títulos curtos para conversas internas.
+
+Responda apenas com uma única frase curta em português do Brasil, sem aspas, com no máximo 90 caracteres.
+O título deve resumir o assunto principal da conversa com clareza, como o ChatGPT faria.
+Não use prefixos como "Título:", não enumere, não explique e não mencione que é um resumo.`;
 const SYSTEM_PROMPT = `Você é o SmartAI, assistente de suporte interno da Smart Leilões, atuando no segmento Smart Caixa.
 
 Se te perguntarem quem foi André Prado, responda dizendo 'Grande Amigo do Davi Tigela - Sistemas'.
@@ -3021,6 +3054,89 @@ function extractResponseAnswerAndWebSources(response) {
     answer: answerParts.join('\n\n').trim(),
     webSources: Array.from(webSourceMap.values()),
   };
+}
+
+function buildChatTitleGenerationInput({ question, answer, files = [] }) {
+  const sections = [];
+  const normalizedQuestion = normalizeQuery(question || '');
+  const normalizedAnswer = normalizeExtractedText(answer || '', 600);
+  const attachmentNames = files
+    .map((file) => normalizeUploadedFileName(file?.originalname || file?.displayName || file?.name || ''))
+    .filter(Boolean);
+
+  if (normalizedQuestion) {
+    sections.push(`Mensagem do usuario: ${normalizedQuestion}`);
+  }
+
+  if (attachmentNames.length) {
+    sections.push(`Arquivos anexados: ${attachmentNames.join(', ')}`);
+  }
+
+  if (normalizedAnswer) {
+    sections.push(`Resposta da IA: ${normalizedAnswer}`);
+  }
+
+  return sections.join('\n');
+}
+
+async function generateChatTitleFromConversation({ question, answer, files = [], requestId = '' }) {
+  const titleInput = buildChatTitleGenerationInput({ question, answer, files });
+  if (!titleInput) {
+    return '';
+  }
+
+  try {
+    const response = await openai.responses.create({
+      model: CHAT_TITLE_MODEL,
+      instructions: CHAT_TITLE_PROMPT,
+      input: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: titleInput,
+            },
+          ],
+        },
+      ],
+      max_output_tokens: 70,
+      temperature: 0.1,
+      truncation: 'auto',
+    });
+
+    const generated = extractResponseAnswerAndWebSources(response).answer;
+    return normalizeChatTitle(generated, '');
+  } catch (error) {
+    console.warn(`[SmartAI][${requestId || 'chat-title'}] Falha ao gerar titulo automatico do chat:`, error?.message || error);
+    return '';
+  }
+}
+
+async function maybeUpdateGeneratedChatTitle({
+  chatId,
+  shouldGenerateTitle,
+  question,
+  answer,
+  files = [],
+  requestId = '',
+}) {
+  if (!shouldGenerateTitle || !chatId) {
+    return null;
+  }
+
+  const generatedTitle = await generateChatTitleFromConversation({
+    question,
+    answer,
+    files,
+    requestId,
+  });
+
+  if (!generatedTitle) {
+    return null;
+  }
+
+  return updateChatTitle(chatId, generatedTitle);
 }
 
 function createRequestId() {
@@ -3247,6 +3363,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
         updateChatTitleIfDefault(chat.id, buildChatTitleFromInput(displayQuestion, files))
       ));
     }
+    const shouldGenerateTitle = !requestedChatId || Number(chat?.message_count || 0) === 0;
 
     userMessage = await stageTimer.measure('saveUserMessage', async () => (
       createMessage({
@@ -3385,6 +3502,21 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
         await stageTimer.measure('saveAssistantSources', async () => (
           createAssistantSources(assistantMessage.id, notionPersistableSources)
         ));
+      }
+
+      const titledChat = await stageTimer.measure('generateChatTitle', async () => (
+        maybeUpdateGeneratedChatTitle({
+          chatId: chat.id,
+          shouldGenerateTitle,
+          question: displayQuestion,
+          answer: clarificationAnswer,
+          files,
+          requestId,
+        })
+      ));
+      if (titledChat) {
+        chat = titledChat;
+        payload.chat = serializeChat(titledChat);
       }
 
       payload.assistantMessageId = assistantMessage.id;
@@ -3609,6 +3741,21 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
         ));
       }
 
+      const titledChat = await stageTimer.measure('generateChatTitle', async () => (
+        maybeUpdateGeneratedChatTitle({
+          chatId: chat.id,
+          shouldGenerateTitle,
+          question: displayQuestion,
+          answer: finalAnswer,
+          files,
+          requestId,
+        })
+      ));
+      if (titledChat) {
+        chat = titledChat;
+        payload.chat = serializeChat(titledChat);
+      }
+
       payload.assistantMessageId = assistantMessage.id;
       payload.timings.stages = {
         ...stageTimer.snapshot(),
@@ -3686,6 +3833,21 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       await stageTimer.measure('saveAssistantSources', async () => (
         createAssistantSources(assistantMessage.id, persistableSources)
       ));
+    }
+
+    const titledChat = await stageTimer.measure('generateChatTitle', async () => (
+      maybeUpdateGeneratedChatTitle({
+        chatId: chat.id,
+        shouldGenerateTitle,
+        question: displayQuestion,
+        answer,
+        files,
+        requestId,
+      })
+    ));
+    if (titledChat) {
+      chat = titledChat;
+      payload.chat = serializeChat(titledChat);
     }
 
     payload.assistantMessageId = assistantMessage.id;

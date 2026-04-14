@@ -13,6 +13,14 @@ var MAX_ATTACHMENT_TOTAL_BYTES = 30 * 1024 * 1024;
 var MAX_PROFILE_PHOTO_BYTES = 30 * 1024 * 1024;
 var ATTACHMENT_UPLOAD_MODE = 'multipart';
 var blobUploadModulePromise = null;
+var SIDEBAR_WIDTH_STORAGE_KEY = 'smartai-layout-sidebar-width';
+var CHAT_WIDTH_STORAGE_KEY = 'smartai-layout-chat-width';
+var DEFAULT_SIDEBAR_WIDTH = 260;
+var DEFAULT_CHAT_CONTENT_WIDTH = 760;
+var MIN_SIDEBAR_WIDTH = 240;
+var MAX_SIDEBAR_WIDTH = 380;
+var MIN_CHAT_CONTENT_WIDTH = 720;
+var MAX_CHAT_CONTENT_WIDTH = 1160;
 
 var AI_AVATAR_ASSET = 'logo-smart.png';
 
@@ -23,6 +31,75 @@ function formatByteSize(bytes) {
   }
 
   return (value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + 'MB';
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function readStoredLayoutWidth(storageKey, fallbackValue, minValue, maxValue) {
+  try {
+    var stored = parseInt(localStorage.getItem(storageKey), 10);
+    if (Number.isFinite(stored)) {
+      return clampNumber(stored, minValue, maxValue);
+    }
+  } catch (error) {}
+
+  return fallbackValue;
+}
+
+function updateLayoutOutput(outputId, value) {
+  var output = document.getElementById(outputId);
+  if (!output) return;
+  output.textContent = String(value) + 'px';
+}
+
+function applyLayoutWidths(sidebarWidth, chatWidth) {
+  document.documentElement.style.setProperty('--sidebar-width', String(sidebarWidth) + 'px');
+  document.documentElement.style.setProperty('--chat-content-width', String(chatWidth) + 'px');
+  updateLayoutOutput('sidebarWidthValue', sidebarWidth);
+  updateLayoutOutput('chatWidthValue', chatWidth);
+}
+
+function initLayoutControls() {
+  var sidebarRange = document.getElementById('sidebarWidthRange');
+  var chatRange = document.getElementById('chatWidthRange');
+  if (!sidebarRange || !chatRange) return;
+
+  var sidebarWidth = readStoredLayoutWidth(
+    SIDEBAR_WIDTH_STORAGE_KEY,
+    DEFAULT_SIDEBAR_WIDTH,
+    MIN_SIDEBAR_WIDTH,
+    MAX_SIDEBAR_WIDTH
+  );
+  var chatWidth = readStoredLayoutWidth(
+    CHAT_WIDTH_STORAGE_KEY,
+    DEFAULT_CHAT_CONTENT_WIDTH,
+    MIN_CHAT_CONTENT_WIDTH,
+    MAX_CHAT_CONTENT_WIDTH
+  );
+
+  sidebarRange.value = String(sidebarWidth);
+  chatRange.value = String(chatWidth);
+  applyLayoutWidths(sidebarWidth, chatWidth);
+
+  sidebarRange.addEventListener('input', function () {
+    var nextWidth = clampNumber(parseInt(sidebarRange.value, 10) || DEFAULT_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    applyLayoutWidths(nextWidth, clampNumber(parseInt(chatRange.value, 10) || DEFAULT_CHAT_CONTENT_WIDTH, MIN_CHAT_CONTENT_WIDTH, MAX_CHAT_CONTENT_WIDTH));
+
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
+    } catch (error) {}
+  });
+
+  chatRange.addEventListener('input', function () {
+    var nextWidth = clampNumber(parseInt(chatRange.value, 10) || DEFAULT_CHAT_CONTENT_WIDTH, MIN_CHAT_CONTENT_WIDTH, MAX_CHAT_CONTENT_WIDTH);
+    applyLayoutWidths(clampNumber(parseInt(sidebarRange.value, 10) || DEFAULT_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH), nextWidth);
+
+    try {
+      localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
+    } catch (error) {}
+  });
 }
 
 function applyClientConfig(config) {
@@ -595,6 +672,10 @@ function syncRequestMeta(requestState, payload) {
 
   if (payload.chatId) {
     requestState.chatId = payload.chatId;
+  }
+
+  if (payload.chat) {
+    upsertChatSummary(payload.chat);
   }
 
   if (payload.userMessageId) {
@@ -1813,6 +1894,7 @@ function handleAuthResultQuery() {
 
 (async function init() {
   applyTheme(loadStoredTheme(), { remote: false, silent: true });
+  initLayoutControls();
   updateInputHint();
   initDragAndDrop();
   bindAuthShortcuts();

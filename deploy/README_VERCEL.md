@@ -32,6 +32,20 @@ GOOGLE_REDIRECT_URI=https://SEU_DOMINIO/api/auth/google/callback
 
 O app aceita `DATABASE_URL` e também `POSTGRES_URL`. Se o provedor conectado pela Vercel preencher `POSTGRES_URL` automaticamente, o backend já consegue usar esse valor.
 
+Se `BLOB_READ_WRITE_TOKEN` estiver configurado, o app passa a usar upload direto para o Vercel Blob automaticamente quando estiver rodando na Vercel. Isso evita o limite de corpo da Function para anexos maiores.
+
+Se você precisar forçar comportamento:
+
+```env
+SMARTAI_ENABLE_DIRECT_ATTACHMENT_UPLOADS=true
+```
+
+ou, para desabilitar explicitamente:
+
+```env
+SMARTAI_ENABLE_DIRECT_ATTACHMENT_UPLOADS=false
+```
+
 ## 3. Banco de dados
 
 Rode as migrations no banco de produção antes de liberar o tráfego:
@@ -69,11 +83,12 @@ No Google Cloud Console, cadastre exatamente:
 
 ## 7. Limites atuais do deploy
 
-- até 3 anexos por envio
-- até 4MB somados por requisição com anexos
-- foto de perfil com até 4MB
+- upload via servidor na Vercel continua sujeito ao limite de corpo da Function
+- para anexos grandes, use upload direto para o Blob
+- o limite efetivo de anexos do app passa a ser o configurado em `SMARTAI_ATTACHMENT_FILE_LIMIT_BYTES`
+- foto de perfil continua limitada pelo upload via servidor do ambiente
 
-Esses limites foram deixados assim para respeitar o modelo serverless da Vercel usando upload via servidor. Se no próximo passo você quiser uploads maiores, a evolução natural é migrar anexos para client upload direto no Blob.
+Importante: aumentar uma variável local do app para `30MB` não altera o limite nativo de corpo da Vercel para uploads que ainda passam pela Function. Para arquivos maiores, o fluxo precisa ser direto do navegador para o Blob.
 
 ## 8. O que não usar mais neste deploy
 
