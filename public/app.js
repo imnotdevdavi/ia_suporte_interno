@@ -13,12 +13,13 @@ var MAX_ATTACHMENT_TOTAL_BYTES = 30 * 1024 * 1024;
 var MAX_PROFILE_PHOTO_BYTES = 30 * 1024 * 1024;
 var ATTACHMENT_UPLOAD_MODE = 'multipart';
 var blobUploadModulePromise = null;
-var SIDEBAR_PRESET_STORAGE_KEY = 'smartai-layout-sidebar-preset';
-var SIDEBAR_WIDTH_PRESETS = [
-  { id: 'compact', width: 248, label: 'Compacta' },
-  { id: 'default', width: 260, label: 'Padrão' },
-  { id: 'wide', width: 320, label: 'Ampla' }
-];
+var SIDEBAR_WIDTH_STORAGE_KEY = 'smartai-layout-sidebar-width';
+var DEFAULT_SIDEBAR_WIDTH = 260;
+var MIN_SIDEBAR_WIDTH = 220;
+var MAX_SIDEBAR_WIDTH = 420;
+var MIN_MAIN_AREA_WIDTH = 680;
+var MOBILE_LAYOUT_BREAKPOINT = 860;
+var sidebarResizeState = null;
 
 var AI_AVATAR_ASSET = 'logo-smart.png';
 
@@ -31,58 +32,130 @@ function formatByteSize(bytes) {
   return (value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + 'MB';
 }
 
-function getSidebarPresetById(presetId) {
-  var match = SIDEBAR_WIDTH_PRESETS.find(function (preset) {
-    return preset.id === presetId;
-  });
-
-  return match || SIDEBAR_WIDTH_PRESETS[1];
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
 
-function applySidebarPreset(presetId) {
-  var preset = getSidebarPresetById(presetId);
-  var button = document.getElementById('btnSidebarWidth');
+function getSidebarWidthBounds() {
+  var viewportWidth = Math.max(window.innerWidth || 0, document.documentElement.clientWidth || 0);
+  var dynamicMax = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, viewportWidth - MIN_MAIN_AREA_WIDTH));
+  return {
+    min: MIN_SIDEBAR_WIDTH,
+    max: dynamicMax
+  };
+}
 
-  document.documentElement.style.setProperty('--sidebar-width', String(preset.width) + 'px');
+function applySidebarWidth(width, options) {
+  options = options || {};
 
-  if (button) {
-    button.dataset.sidebarPreset = preset.id;
-    button.classList.toggle('is-wide', preset.id === 'wide');
-    button.title = 'Largura da barra lateral: ' + preset.label;
-    button.setAttribute('aria-label', 'Largura da barra lateral: ' + preset.label);
+  var bounds = getSidebarWidthBounds();
+  var nextWidth = clampNumber(Math.round(Number(width) || DEFAULT_SIDEBAR_WIDTH), bounds.min, bounds.max);
+  var resizer = document.getElementById('sidebarResizer');
+
+  document.documentElement.style.setProperty('--sidebar-width', String(nextWidth) + 'px');
+
+  if (resizer) {
+    resizer.setAttribute('aria-valuemin', String(bounds.min));
+    resizer.setAttribute('aria-valuemax', String(bounds.max));
+    resizer.setAttribute('aria-valuenow', String(nextWidth));
   }
 
-  try {
-    localStorage.setItem(SIDEBAR_PRESET_STORAGE_KEY, preset.id);
-  } catch (error) {}
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
+    } catch (error) {}
+  }
 
-  return preset;
+  return nextWidth;
 }
 
-function initSidebarWidthControl() {
-  var storedPresetId = '';
+function readStoredSidebarWidth() {
+  var storedWidth = NaN;
 
   try {
-    storedPresetId = String(localStorage.getItem(SIDEBAR_PRESET_STORAGE_KEY) || '').trim();
+    storedWidth = parseInt(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY), 10);
   } catch (error) {}
 
-  applySidebarPreset(storedPresetId || 'default');
+  if (!Number.isFinite(storedWidth)) {
+    return DEFAULT_SIDEBAR_WIDTH;
+  }
+
+  return storedWidth;
 }
 
-function toggleSidebarWidth() {
-  var currentPresetId = '';
+function syncSidebarWidthForViewport() {
+  if (window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT) {
+    document.body.classList.remove('resizing-sidebar');
+    return;
+  }
 
-  try {
-    currentPresetId = String(localStorage.getItem(SIDEBAR_PRESET_STORAGE_KEY) || '').trim();
-  } catch (error) {}
+  applySidebarWidth(readStoredSidebarWidth(), { persist: false });
+}
 
-  var currentIndex = SIDEBAR_WIDTH_PRESETS.findIndex(function (preset) {
-    return preset.id === currentPresetId;
+function stopSidebarResize() {
+  var resizer = document.getElementById('sidebarResizer');
+  document.body.classList.remove('resizing-sidebar');
+  if (resizer) {
+    resizer.classList.remove('is-active');
+  }
+  sidebarResizeState = null;
+}
+
+function handleSidebarResizeMove(event) {
+  if (!sidebarResizeState) return;
+  if (window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT) {
+    stopSidebarResize();
+    return;
+  }
+
+  var pointerX = typeof event.clientX === 'number' ? event.clientX : sidebarResizeState.startX;
+  var delta = pointerX - sidebarResizeState.startX;
+  sidebarResizeState.currentWidth = applySidebarWidth(sidebarResizeState.startWidth + delta, { persist: false });
+}
+
+function handleSidebarResizeEnd() {
+  if (!sidebarResizeState) return;
+
+  window.removeEventListener('pointermove', handleSidebarResizeMove);
+  window.removeEventListener('pointerup', handleSidebarResizeEnd);
+  window.removeEventListener('pointercancel', handleSidebarResizeEnd);
+  applySidebarWidth(sidebarResizeState.currentWidth || sidebarResizeState.startWidth);
+  stopSidebarResize();
+}
+
+function startSidebarResize(event) {
+  if (window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT) return;
+
+  var resizer = document.getElementById('sidebarResizer');
+  sidebarResizeState = {
+    startX: event.clientX,
+    startWidth: applySidebarWidth(readStoredSidebarWidth(), { persist: false }),
+    currentWidth: null
+  };
+
+  document.body.classList.add('resizing-sidebar');
+  if (resizer) {
+    resizer.classList.add('is-active');
+  }
+
+  window.addEventListener('pointermove', handleSidebarResizeMove);
+  window.addEventListener('pointerup', handleSidebarResizeEnd);
+  window.addEventListener('pointercancel', handleSidebarResizeEnd);
+}
+
+function initSidebarResizeControl() {
+  var resizer = document.getElementById('sidebarResizer');
+  if (!resizer) return;
+
+  syncSidebarWidthForViewport();
+
+  resizer.addEventListener('pointerdown', function (event) {
+    if (event.button !== 0 && event.pointerType !== 'touch') return;
+    event.preventDefault();
+    startSidebarResize(event);
   });
-  var nextPreset = SIDEBAR_WIDTH_PRESETS[(currentIndex + 1 + SIDEBAR_WIDTH_PRESETS.length) % SIDEBAR_WIDTH_PRESETS.length];
-  var appliedPreset = applySidebarPreset(nextPreset.id);
 
-  showToast('Barra lateral: ' + appliedPreset.label);
+  window.addEventListener('resize', syncSidebarWidthForViewport);
 }
 
 function applyClientConfig(config) {
@@ -1877,7 +1950,7 @@ function handleAuthResultQuery() {
 
 (async function init() {
   applyTheme(loadStoredTheme(), { remote: false, silent: true });
-  initSidebarWidthControl();
+  initSidebarResizeControl();
   updateInputHint();
   initDragAndDrop();
   bindAuthShortcuts();

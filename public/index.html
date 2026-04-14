@@ -98,13 +98,6 @@
           <div class="brand-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="brand-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback" style="display:none;">✦</span></div>
           <span class="brand-name">SmartAI</span>
         </div>
-        <button class="sidebar-width-toggle" id="btnSidebarWidth" onclick="toggleSidebarWidth()" title="Alternar largura da barra lateral">
-          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M3 12h18"/>
-            <path d="m7 8-4 4 4 4"/>
-            <path d="m17 8 4 4-4 4"/>
-          </svg>
-        </button>
       </div>
 
       <div class="search-bar" id="searchBar">
@@ -160,6 +153,23 @@
         Sair
       </button>
     </div>
+  </div>
+
+  <div
+    class="sidebar-resizer"
+    id="sidebarResizer"
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="Ajustar largura da barra lateral"
+    title="Arraste para ajustar a barra lateral"
+  >
+    <span class="sidebar-resizer-grip" aria-hidden="true">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+        <path d="M3 12h18"/>
+        <path d="m8 8-4 4 4 4"/>
+        <path d="m16 8 4 4-4 4"/>
+      </svg>
+    </span>
   </div>
 
   <!-- ÁREA PRINCIPAL -->
