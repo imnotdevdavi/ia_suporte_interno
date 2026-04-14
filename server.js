@@ -96,9 +96,9 @@ const MAX_ATTACHMENT_REQUEST_SIZE = getMaxAttachmentRequestBytes();
 const PROFILE_MAX_FILE_SIZE = getMaxProfilePhotoBytes();
 const ENABLE_WEB_SEARCH = String(process.env.SMARTAI_ENABLE_WEB_SEARCH || 'true').trim().toLowerCase() !== 'false';
 const MAX_MODEL_OUTPUT_TOKENS = Number.parseInt(
-  String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '8192').trim(),
+  String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '10000').trim(),
   10
-) || 8192;
+) || 10000;
 const WEB_SEARCH_TOOL = {
   type: 'web_search_preview',
   search_context_size: 'high',
@@ -3319,7 +3319,7 @@ function sanitizeAssistantMarkdown(text) {
       .replace(/^(#{4,})\s+/gm, '## ')
       .replace(/(^\d+\.\s[^\n]+)\n{2,}(?=\d+\.\s)/gm, '$1\n')
       .replace(/(^[-*]\s[^\n]+)\n{2,}(?=[-*]\s)/gm, '$1\n'),
-    MAX_MODEL_OUTPUT_TOKENS * 6
+    MAX_MODEL_OUTPUT_TOKENS * 9
   );
 }
 
