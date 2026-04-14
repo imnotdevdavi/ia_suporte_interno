@@ -1187,13 +1187,27 @@ function formatResponse(text) {
   function flushList() {
     if (!listItems.length || !listType) return;
 
-    blocks.push(
-      '<' + listType + '>'
-      + listItems.map(function (item) {
-        return '<li>' + formatInlineMarkdown(item) + '</li>';
-      }).join('')
-      + '</' + listType + '>'
-    );
+    if (listType === 'ol') {
+      var startNumber = Number(listItems[0].number || 1);
+      blocks.push(
+        '<ol start="' + startNumber + '">'
+        + listItems.map(function (item, index) {
+          var explicitNumber = Number(item.number || (startNumber + index));
+          var expectedNumber = startNumber + index;
+          var valueAttr = explicitNumber !== expectedNumber ? ' value="' + explicitNumber + '"' : '';
+          return '<li' + valueAttr + '>' + formatInlineMarkdown(item.text) + '</li>';
+        }).join('')
+        + '</ol>'
+      );
+    } else {
+      blocks.push(
+        '<ul>'
+        + listItems.map(function (item) {
+          return '<li>' + formatInlineMarkdown(item.text) + '</li>';
+        }).join('')
+        + '</ul>'
+      );
+    }
 
     listItems = [];
     listType = null;
@@ -1247,7 +1261,10 @@ function formatResponse(text) {
       flushParagraph();
       if (listType && listType !== 'ol') flushList();
       listType = 'ol';
-      listItems.push(orderedMatch[2]);
+      listItems.push({
+        number: Number(orderedMatch[1]),
+        text: orderedMatch[2]
+      });
       return;
     }
 
@@ -1256,7 +1273,14 @@ function formatResponse(text) {
       flushParagraph();
       if (listType && listType !== 'ul') flushList();
       listType = 'ul';
-      listItems.push(bulletMatch[1]);
+      listItems.push({
+        text: bulletMatch[1]
+      });
+      return;
+    }
+
+    if (listType && listItems.length) {
+      listItems[listItems.length - 1].text += ' ' + trimmed;
       return;
     }
 
