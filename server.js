@@ -1358,29 +1358,13 @@ async function extractFileContent(file) {
     }
 
     if (mimetype === 'application/pdf' || extension === '.pdf') {
-      const content = await extractPdfText(tmpPath);
-      if (!content) {
-        const pages = await extractPdfPagesAsImages(tmpPath, originalname);
-        if (pages.length) {
-          console.log(`[SmartAI][arquivo] ${originalname}: PDF sem texto embutido, convertido em ${pages.length} imagem(ns).`);
-          return {
-            type: 'pdf_images',
-            name: originalname,
-            images: pages,
-            reason: 'PDF convertido em imagens para analise visual.',
-          };
-        }
-
-        return {
-          type: 'error',
-          name: originalname,
-          reason: isVercelRuntime()
-            ? 'O PDF nao retornou texto legivel e a conversao visual falhou neste ambiente. Se ele for escaneado, tente reenviar uma versao pesquisavel.'
-            : 'O PDF nao retornou texto legivel nem imagens utilizaveis. Se ele for escaneado, pode precisar de OCR.',
-        };
-      }
-      console.log(`[SmartAI][arquivo] ${originalname}: PDF lido como texto.`);
-      return { type: 'text', content, name: originalname };
+      console.log(`[SmartAI][arquivo] ${originalname}: PDF preparado para envio nativo ao modelo.`);
+      return {
+        type: 'pdf_file',
+        path: tmpPath,
+        mime: 'application/pdf',
+        name: originalname,
+      };
     }
 
     if (mimetype === DOCX_MIME || extension === '.docx') {
@@ -1427,8 +1411,6 @@ async function extractFileContent(file) {
   } catch (error) {
     console.error(`Falha ao extrair arquivo ${originalname}:`, error);
     return { type: 'error', name: originalname, reason: 'Nao foi possivel ler este arquivo.' };
-  } finally {
-    await safeUnlink(tmpPath);
   }
 }
 
@@ -1624,7 +1606,7 @@ async function safeRm(filePath) {
 }
 
 function isReadableExtractedFile(file) {
-  return ['text', 'image', 'pdf_images'].includes(file?.type);
+  return ['text', 'image', 'pdf_images', 'pdf_file'].includes(file?.type);
 }
 
 function buildAttachmentSearchText(extracted = []) {
@@ -1633,7 +1615,7 @@ function buildAttachmentSearchText(extracted = []) {
       return [`${file.name} ${file.content.slice(0, 500)}`];
     }
 
-    if (file.type === 'pdf_images' || file.type === 'image') {
+    if (file.type === 'pdf_images' || file.type === 'image' || file.type === 'pdf_file') {
       return [file.name];
     }
 
@@ -2291,6 +2273,9 @@ function buildAttachmentPersistencePayload(file, storedFile, extractedFile) {
     extractedText = extractedFile.content || null;
   } else if (extractedFile?.type === 'image') {
     extractedMetadata.imageMime = extractedFile.mime || null;
+  } else if (extractedFile?.type === 'pdf_file') {
+    extractedMetadata.fileMime = extractedFile.mime || 'application/pdf';
+    extractedMetadata.processingMethod = 'openai_file_id';
   } else if (extractedFile?.type === 'pdf_images') {
     extractedMetadata.reason = extractedFile.reason || null;
     extractedMetadata.derivedImageCount = Array.isArray(extractedFile.images) ? extractedFile.images.length : 0;
@@ -3182,6 +3167,36 @@ function resolveRequestErrorMessage(error) {
   return 'Erro interno ao processar a pergunta.';
 }
 
+async function uploadPdfFileForModel(tmpPath, originalname, requestId = '') {
+  const uploaded = await openai.files.create({
+    file: fs.createReadStream(tmpPath),
+    purpose: 'user_data',
+  });
+
+  if (uploaded?.id && uploaded?.status && uploaded.status !== 'processed') {
+    await openai.files.waitForProcessing(uploaded.id, {
+      pollInterval: 500,
+      maxWait: 30 * 1000,
+    });
+  }
+
+  console.log(`[SmartAI][${requestId || 'arquivo'}] PDF enviado para a Files API da OpenAI: ${originalname} -> ${uploaded.id}`);
+  return uploaded.id;
+}
+
+async function cleanupOpenAiFiles(fileIds = [], requestId = '') {
+  const uniqueIds = [...new Set(fileIds.filter(Boolean))];
+  if (!uniqueIds.length) return;
+
+  await Promise.allSettled(uniqueIds.map(async (fileId) => {
+    try {
+      await openai.files.del(fileId);
+    } catch (error) {
+      console.warn(`[SmartAI][${requestId || 'cleanup'}] Falha ao excluir arquivo temporario da OpenAI (${fileId}):`, error?.message || error);
+    }
+  }));
+}
+
 function buildPagesDebug(pages) {
   return pages.map((page) => ({
     title: page.title,
@@ -3323,6 +3338,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
   let userMessage = null;
   let notionMetrics = null;
   let uploadedAttachmentRefs = [];
+  let uploadedModelFileIds = [];
   let files = req.files || [];
 
   if (req.is('application/json')) {
@@ -3590,6 +3606,37 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
           detail: 'high',
         });
         userContentParts.push({ type: 'input_text', text: `[Pagina do PDF anexado: ${image.name}]` });
+      });
+    });
+
+    const extractedForPrompt = extracted.some((f) => f.type === 'pdf_file')
+      ? await stageTimer.measure('uploadPdfInputs', async () => {
+        const pdfFileIdByPath = new Map();
+
+        await Promise.all(extracted
+          .filter((f) => f.type === 'pdf_file')
+          .map(async (f) => {
+            const fileId = await uploadPdfFileForModel(f.path, f.name, requestId);
+            uploadedModelFileIds.push(fileId);
+            pdfFileIdByPath.set(f.path, fileId);
+          }));
+
+        return extracted.map((f) => (
+          f.type === 'pdf_file'
+            ? { ...f, fileId: pdfFileIdByPath.get(f.path) || null }
+            : f
+        ));
+      })
+      : extracted;
+
+    extractedForPrompt.filter((f) => f.type === 'pdf_file').forEach((f) => {
+      userContentParts.push({
+        type: 'input_file',
+        file_id: f.fileId,
+      });
+      userContentParts.push({
+        type: 'input_text',
+        text: `[PDF anexado nesta conversa: ${f.name}] Analise este PDF diretamente, considerando o texto e as imagens de cada pagina.`,
       });
     });
 
@@ -3904,6 +3951,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
 
     res.status(errorStatus).json({ error: errorMessage });
   } finally {
+    await cleanupOpenAiFiles(uploadedModelFileIds, requestId);
     await cleanupTemporaryRequestFiles(files);
   }
 });
