@@ -16,7 +16,6 @@
   --border-hover: rgba(255, 255, 255, 0.12);
   --danger: #ef4444;
   --sidebar-width: 260px;
-  --chat-content-width: 760px;
   --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   --shadow-accent: 0 0 40px rgba(79, 110, 247, 0.15);
 }
@@ -414,8 +413,15 @@ html, body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  justify-content: space-between;
   margin-bottom: 16px;
+}
+
+.brand-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
 }
 
 .brand-icon {
@@ -435,6 +441,33 @@ html, body {
   font-size: 15px;
   font-weight: 700;
   letter-spacing: -0.4px;
+}
+
+.sidebar-width-toggle {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.sidebar-width-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-hover);
+}
+
+.sidebar-width-toggle.is-wide {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
 }
 
 .search-bar {
@@ -704,55 +737,16 @@ html, body {
 .top-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  justify-content: flex-end;
   padding: 14px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-secondary);
   flex-shrink: 0;
 }
 
-.layout-controls {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.layout-control {
-  display: grid;
-  grid-template-columns: auto minmax(96px, 140px) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg-tertiary);
-  min-width: 0;
-}
-
-.layout-control span,
-.layout-control output {
-  font-size: 11px;
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-
-.layout-control output {
-  font-family: 'JetBrains Mono', monospace;
-  color: var(--text-muted);
-}
-
-.layout-control input[type="range"] {
-  width: 100%;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
 .top-actions {
   display: flex;
   gap: 6px;
-  margin-left: auto;
 }
 
 .icon-btn {
@@ -832,7 +826,7 @@ html, body {
 }
 
 .message-wrapper {
-  width: min(100%, var(--chat-content-width));
+  max-width: 760px;
   margin: 0 auto;
   padding: 0 24px;
 }
@@ -1086,7 +1080,8 @@ html, body {
 }
 
 .input-inner {
-  width: min(100%, var(--chat-content-width));
+  max-width: 760px;
+  width: 100%;
   margin: 0 auto;
 }
 
@@ -1473,12 +1468,6 @@ html, body {
 }
 .msg-source-link:hover { opacity: 0.75; }
 
-@media (max-width: 1080px) {
-  .layout-controls {
-    display: none;
-  }
-}
-
 @media (max-width: 860px) {
   .sidebar {
     width: clamp(92px, 28vw, 120px);
@@ -1495,7 +1484,8 @@ html, body {
   .search-bar,
   .user-info,
   .user-row > svg,
-  .chat-item-preview {
+  .chat-item-preview,
+  .sidebar-width-toggle {
     display: none;
   }
 

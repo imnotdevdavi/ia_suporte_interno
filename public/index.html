@@ -94,8 +94,17 @@
 
     <div class="sidebar-top">
       <div class="brand">
-        <div class="brand-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="brand-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback" style="display:none;">✦</span></div>
-        <span class="brand-name">SmartAI</span>
+        <div class="brand-main">
+          <div class="brand-icon"><img src="./assets/logo-smart.png" alt="SmartAI" class="brand-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="brand-logo-fallback" style="display:none;">✦</span></div>
+          <span class="brand-name">SmartAI</span>
+        </div>
+        <button class="sidebar-width-toggle" id="btnSidebarWidth" onclick="toggleSidebarWidth()" title="Alternar largura da barra lateral">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 12h18"/>
+            <path d="m7 8-4 4 4 4"/>
+            <path d="m17 8 4 4-4 4"/>
+          </svg>
+        </button>
       </div>
 
       <div class="search-bar" id="searchBar">
@@ -157,18 +166,6 @@
   <div class="main-area">
 
     <div class="top-bar">
-      <div class="layout-controls" id="layoutControls">
-        <label class="layout-control" for="sidebarWidthRange">
-          <span>Barra lateral</span>
-          <input type="range" id="sidebarWidthRange" min="240" max="380" step="4">
-          <output id="sidebarWidthValue">260px</output>
-        </label>
-        <label class="layout-control" for="chatWidthRange">
-          <span>Chat</span>
-          <input type="range" id="chatWidthRange" min="720" max="1160" step="8">
-          <output id="chatWidthValue">760px</output>
-        </label>
-      </div>
       <div class="top-actions">
         <div class="icon-btn" id="btnThemeTop" onclick="openThemes()" title="Tema">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">

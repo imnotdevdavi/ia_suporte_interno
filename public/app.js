@@ -13,14 +13,12 @@ var MAX_ATTACHMENT_TOTAL_BYTES = 30 * 1024 * 1024;
 var MAX_PROFILE_PHOTO_BYTES = 30 * 1024 * 1024;
 var ATTACHMENT_UPLOAD_MODE = 'multipart';
 var blobUploadModulePromise = null;
-var SIDEBAR_WIDTH_STORAGE_KEY = 'smartai-layout-sidebar-width';
-var CHAT_WIDTH_STORAGE_KEY = 'smartai-layout-chat-width';
-var DEFAULT_SIDEBAR_WIDTH = 260;
-var DEFAULT_CHAT_CONTENT_WIDTH = 760;
-var MIN_SIDEBAR_WIDTH = 240;
-var MAX_SIDEBAR_WIDTH = 380;
-var MIN_CHAT_CONTENT_WIDTH = 720;
-var MAX_CHAT_CONTENT_WIDTH = 1160;
+var SIDEBAR_PRESET_STORAGE_KEY = 'smartai-layout-sidebar-preset';
+var SIDEBAR_WIDTH_PRESETS = [
+  { id: 'compact', width: 248, label: 'Compacta' },
+  { id: 'default', width: 260, label: 'Padrão' },
+  { id: 'wide', width: 320, label: 'Ampla' }
+];
 
 var AI_AVATAR_ASSET = 'logo-smart.png';
 
@@ -33,73 +31,58 @@ function formatByteSize(bytes) {
   return (value / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + 'MB';
 }
 
-function clampNumber(value, min, max) {
-  return Math.min(Math.max(value, min), max);
+function getSidebarPresetById(presetId) {
+  var match = SIDEBAR_WIDTH_PRESETS.find(function (preset) {
+    return preset.id === presetId;
+  });
+
+  return match || SIDEBAR_WIDTH_PRESETS[1];
 }
 
-function readStoredLayoutWidth(storageKey, fallbackValue, minValue, maxValue) {
+function applySidebarPreset(presetId) {
+  var preset = getSidebarPresetById(presetId);
+  var button = document.getElementById('btnSidebarWidth');
+
+  document.documentElement.style.setProperty('--sidebar-width', String(preset.width) + 'px');
+
+  if (button) {
+    button.dataset.sidebarPreset = preset.id;
+    button.classList.toggle('is-wide', preset.id === 'wide');
+    button.title = 'Largura da barra lateral: ' + preset.label;
+    button.setAttribute('aria-label', 'Largura da barra lateral: ' + preset.label);
+  }
+
   try {
-    var stored = parseInt(localStorage.getItem(storageKey), 10);
-    if (Number.isFinite(stored)) {
-      return clampNumber(stored, minValue, maxValue);
-    }
+    localStorage.setItem(SIDEBAR_PRESET_STORAGE_KEY, preset.id);
   } catch (error) {}
 
-  return fallbackValue;
+  return preset;
 }
 
-function updateLayoutOutput(outputId, value) {
-  var output = document.getElementById(outputId);
-  if (!output) return;
-  output.textContent = String(value) + 'px';
+function initSidebarWidthControl() {
+  var storedPresetId = '';
+
+  try {
+    storedPresetId = String(localStorage.getItem(SIDEBAR_PRESET_STORAGE_KEY) || '').trim();
+  } catch (error) {}
+
+  applySidebarPreset(storedPresetId || 'default');
 }
 
-function applyLayoutWidths(sidebarWidth, chatWidth) {
-  document.documentElement.style.setProperty('--sidebar-width', String(sidebarWidth) + 'px');
-  document.documentElement.style.setProperty('--chat-content-width', String(chatWidth) + 'px');
-  updateLayoutOutput('sidebarWidthValue', sidebarWidth);
-  updateLayoutOutput('chatWidthValue', chatWidth);
-}
+function toggleSidebarWidth() {
+  var currentPresetId = '';
 
-function initLayoutControls() {
-  var sidebarRange = document.getElementById('sidebarWidthRange');
-  var chatRange = document.getElementById('chatWidthRange');
-  if (!sidebarRange || !chatRange) return;
+  try {
+    currentPresetId = String(localStorage.getItem(SIDEBAR_PRESET_STORAGE_KEY) || '').trim();
+  } catch (error) {}
 
-  var sidebarWidth = readStoredLayoutWidth(
-    SIDEBAR_WIDTH_STORAGE_KEY,
-    DEFAULT_SIDEBAR_WIDTH,
-    MIN_SIDEBAR_WIDTH,
-    MAX_SIDEBAR_WIDTH
-  );
-  var chatWidth = readStoredLayoutWidth(
-    CHAT_WIDTH_STORAGE_KEY,
-    DEFAULT_CHAT_CONTENT_WIDTH,
-    MIN_CHAT_CONTENT_WIDTH,
-    MAX_CHAT_CONTENT_WIDTH
-  );
-
-  sidebarRange.value = String(sidebarWidth);
-  chatRange.value = String(chatWidth);
-  applyLayoutWidths(sidebarWidth, chatWidth);
-
-  sidebarRange.addEventListener('input', function () {
-    var nextWidth = clampNumber(parseInt(sidebarRange.value, 10) || DEFAULT_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-    applyLayoutWidths(nextWidth, clampNumber(parseInt(chatRange.value, 10) || DEFAULT_CHAT_CONTENT_WIDTH, MIN_CHAT_CONTENT_WIDTH, MAX_CHAT_CONTENT_WIDTH));
-
-    try {
-      localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(nextWidth));
-    } catch (error) {}
+  var currentIndex = SIDEBAR_WIDTH_PRESETS.findIndex(function (preset) {
+    return preset.id === currentPresetId;
   });
+  var nextPreset = SIDEBAR_WIDTH_PRESETS[(currentIndex + 1 + SIDEBAR_WIDTH_PRESETS.length) % SIDEBAR_WIDTH_PRESETS.length];
+  var appliedPreset = applySidebarPreset(nextPreset.id);
 
-  chatRange.addEventListener('input', function () {
-    var nextWidth = clampNumber(parseInt(chatRange.value, 10) || DEFAULT_CHAT_CONTENT_WIDTH, MIN_CHAT_CONTENT_WIDTH, MAX_CHAT_CONTENT_WIDTH);
-    applyLayoutWidths(clampNumber(parseInt(sidebarRange.value, 10) || DEFAULT_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH), nextWidth);
-
-    try {
-      localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
-    } catch (error) {}
-  });
+  showToast('Barra lateral: ' + appliedPreset.label);
 }
 
 function applyClientConfig(config) {
@@ -1894,7 +1877,7 @@ function handleAuthResultQuery() {
 
 (async function init() {
   applyTheme(loadStoredTheme(), { remote: false, silent: true });
-  initLayoutControls();
+  initSidebarWidthControl();
   updateInputHint();
   initDragAndDrop();
   bindAuthShortcuts();
