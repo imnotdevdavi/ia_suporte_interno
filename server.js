@@ -96,9 +96,9 @@ const MAX_ATTACHMENT_REQUEST_SIZE = getMaxAttachmentRequestBytes();
 const PROFILE_MAX_FILE_SIZE = getMaxProfilePhotoBytes();
 const ENABLE_WEB_SEARCH = String(process.env.SMARTAI_ENABLE_WEB_SEARCH || 'false').trim().toLowerCase() === 'true';
 const MAX_MODEL_OUTPUT_TOKENS = Number.parseInt(
-  String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '10000').trim(),
+  String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '14000').trim(),
   10
-) || 10000;
+) || 14000;
 const WEB_SEARCH_TOOL = {
   type: 'web_search_preview',
   search_context_size: 'high',
@@ -295,9 +295,9 @@ const NOTION_PAGE_CACHE_TTL_MS = 1000 * 60 * 15;
 const NOTION_SEARCH_CACHE_MAX_ENTRIES = 200;
 const NOTION_PAGE_CACHE_MAX_ENTRIES = 400;
 const MAX_SECTION_CHARS = 1800;
-const MAX_CONTEXT_PAGES = 3;
-const PRIMARY_PAGE_CONTEXT_CHARS = 6800;
-const SECONDARY_PAGE_CONTEXT_CHARS = 3200;
+const MAX_CONTEXT_PAGES = 4;
+const PRIMARY_PAGE_CONTEXT_CHARS = 9000;
+const SECONDARY_PAGE_CONTEXT_CHARS = 4200;
 const MAX_SNIPPETS_PER_PAGE = 4;
 const CONTEXT_SNIPPET_NEIGHBOR_WINDOW = 1;
 const MIN_RELEVANT_SCORE = 4;
@@ -591,6 +591,23 @@ function mergeCandidates(primary, fallback, resultLimit = FINAL_RESULT_LIMIT) {
     .slice(0, resultLimit);
 }
 
+function buildRelatedQueriesFromQuestion(question) {
+  const terms = buildQuestionTerms(question);
+  if (!terms.length) return [];
+
+  const hints = [];
+  terms.forEach((term) => {
+    const related = RELATED_QUERY_HINTS_MAP.get(term) || [];
+    related.forEach((hint) => hints.push(hint));
+  });
+
+  const capped = (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question))
+    ? hints.slice(0, 6)
+    : hints.slice(0, 3);
+
+  return [...new Set(capped.map((hint) => expandQueryWithAliases(hint).slice(0, 240)).filter(Boolean))];
+}
+
 function buildPrimaryQueries(question) {
   const keywordQuery = buildKeywordFallback(question);
   const normalizedQuestion = expandQueryWithAliases(question).slice(0, 300);
@@ -598,6 +615,7 @@ function buildPrimaryQueries(question) {
     normalizedQuestion,
     ...buildPhraseQueries(question),
     keywordQuery,
+    ...buildRelatedQueriesFromQuestion(question),
   ].filter(Boolean))];
 }
 
@@ -1035,6 +1053,7 @@ function buildQuestionSpecificGuidance(question = '') {
     guidance.push('- Responda em nivel de macroprocesso. Liste somente processos gerais realmente descritos na base.');
     guidance.push('- Nao transforme subtarefas, documentos isolados, checklists, modelos de atividade, mensagens rapidas, prazos de acompanhamento ou sinonimos em processos independentes.');
     guidance.push('- Se registro, averbacao, atualizacao de matricula ou expressoes equivalentes aparecerem como o mesmo ato registral no contexto, consolide isso em um unico processo.');
+    guidance.push('- Se o mesmo procedimento mencionar planilha, formulario, sistema, canal, versao, via alternativa, fornecedor ou documento operacional relevante, apresente isso ja na primeira resposta, sem esperar uma pergunta de aprofundamento.');
   }
 
   if (isBoundaryProcessQuestion(question)) {
@@ -1053,6 +1072,10 @@ function buildQuestionSpecificGuidance(question = '') {
 
   if (/\b(iptu|inscricao municipal)\b/.test(normalized)) {
     guidance.push('- Quando houver lista explicita de passos na base, preserve os passos e a ordem descrita. Nao troque um passo expresso por alternativa apenas plausivel.');
+  }
+
+  if (/\b(diligencia|despachante|correspondente)\b/.test(normalized)) {
+    guidance.push('- Em contratacao de diligencia, traga as vias de execucao, planilhas, canais e documentos relevantes que estiverem descritos no mesmo material.');
   }
 
   if (/\b(registro|titularidade|itbi|iptu|inscricao municipal|cartorio|contrato|financiamento|matricula|imovel)\b/.test(normalized)) {
@@ -1401,6 +1424,26 @@ function shouldExpandSequentialContext(question, page, orderedSnippets = []) {
   });
 }
 
+function shouldStartContextFromTop(question, page, orderedSnippets = []) {
+  const normalizedQuestion = normalizeForMatch(question);
+  const pageArchetype = page?.pageArchetype || getPageArchetype(page);
+
+  if (pageArchetype !== 'process_guide') return false;
+
+  if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
+    return true;
+  }
+
+  if (/\b(como|contratacao|diligencia|procedimento|processo|o que preciso|o que devo)\b/.test(normalizedQuestion)) {
+    return true;
+  }
+
+  return orderedSnippets.some((snippet) => {
+    const normalizedSnippet = normalizeForMatch(`${snippet?.label || ''} ${snippet?.text || ''}`);
+    return /\b(passo a passo|documentacao necessaria|documentos necessarios)\b/.test(normalizedSnippet);
+  });
+}
+
 function buildPageContextExcerpt(page, maxChars, question = '') {
   const sections = page.sections?.length
     ? page.sections
@@ -1418,7 +1461,9 @@ function buildPageContextExcerpt(page, maxChars, question = '') {
       .map((snippet) => snippet.index)
       .filter(Number.isInteger)
       .sort((left, right) => left - right)[0];
-    const startIndex = Math.max(0, (Number.isInteger(firstSnippetIndex) ? firstSnippetIndex : 0) - CONTEXT_SNIPPET_NEIGHBOR_WINDOW);
+    const startIndex = shouldStartContextFromTop(question, page, orderedSnippets)
+      ? 0
+      : Math.max(0, (Number.isInteger(firstSnippetIndex) ? firstSnippetIndex : 0) - CONTEXT_SNIPPET_NEIGHBOR_WINDOW);
 
     for (let index = startIndex; index < sections.length; index += 1) {
       selectedIndexes.add(index);
@@ -1549,6 +1594,17 @@ const KNOWN_BUSINESS_TERMS = new Set([
   'contrato',
   'parceiro',
   'planilha',
+]);
+const RELATED_QUERY_HINTS_MAP = new Map([
+  ['diligencia', ['planilha diligencias', 'correspondente dinamico', 'contratacao diligencia']],
+  ['despachante', ['planilha diligencias', 'correspondente dinamico']],
+  ['itbi', ['troca titularidade itbi', 'emissao itbi']],
+  ['titularidade', ['troca titularidade prefeitura', 'itbi titularidade']],
+  ['registro', ['matricula atualizada nota devolutiva', 'registro titularidade']],
+  ['financiamento', ['itbi registro titularidade', 'contrato financiamento fgts']],
+  ['fgts', ['contrato financiamento fgts', 'registro financiamento']],
+  ['iptu', ['inscricao municipal prefeitura iptu', 'diligencia iptu']],
+  ['matricula', ['registro matricula atualizada', 'inscricao municipal iptu']],
 ]);
 const PROCESS_QUERY_TERMS = [
   'como',
@@ -3244,6 +3300,7 @@ REGRAS DE COMPORTAMENTO:
 - Se a base interna nao trouxer a informação exata, diga isso explicitamente. So mencione fontes externas quando o usuario tiver pedido busca externa.
 - Se existirem variacoes importantes de procedimento por contexto (ex: pre ou pos-arrematacao) e o usuário nao informar qual cenário se aplica, faca uma pergunta curta de esclarecimento antes do passo a passo final. Se ainda assim decidir responder, separe claramente os cenários e nunca misture fluxos distintos.
 - Quando um documento interno descrever um processo, reconstrua o fluxo completo em ordem antes de responder e confira se nenhuma etapa intermediaria ou final ficou de fora.
+- Em respostas procedimentais, pense em um colaborador novo: consolide o fluxo completo de primeira, incluindo ferramentas, planilhas, formularios, sistemas, vias alternativas, documentos e excecoes relevantes que aparecam no mesmo material.
 - Em fluxos cartorarios, contratuais e registrais, nao pule etapas que estejam no material, mesmo que parecam administrativas, como agendamento, validacoes, videoconferencia, assinatura, protocolo, registro e pos-registro.
 - Em perguntas sobre processos, diferencie nivel de abrangencia: processo geral nao e a mesma coisa que subtarefa, checklist, documento exigido, mensagem pronta, modelo de atividade, prazo interno ou etapa operacional.
 - Nao liste subtarefas ou sinonimos como se fossem processos separados. Exemplo de consolidacao: se o contexto tratar "registro", "averbacao" e "atualizacao de matricula" como o mesmo ato registral, responda isso como um unico processo.
@@ -3255,9 +3312,9 @@ REGRAS DE COMPORTAMENTO:
 - Responda sempre em português, com linguagem profissional e acessível.
 - Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou listas numeradas sequenciais para passos, e "**destaque**" para pontos importantes.
 - Nao use "###", "####", tabelas ou estilos incomuns.
-- Em respostas longas, priorize esta estrutura quando fizer sentido: "## Entendimento", "## Como fazer", "## Regras internas", "## Fontes", "## Quando escalar".
-- Na seção de fontes, deixe claro o que veio do Notion e, somente se houver pedido explicito de busca externa, o que veio da Web.
-- Quando houver fontes externas, diga explicitamente que os links completos estao listados nas fontes relacionadas da resposta.`;
+- Nao crie uma secao dedicada de fontes por padrao. A interface ja exibe as fontes relacionadas abaixo da mensagem.
+- Quando citar a origem, faca isso de modo natural e breve no proprio texto, por exemplo "conforme a pagina Contrato de Financiamento". Evite listas de fontes, URLs cruas e blocos de referencias no corpo da resposta.
+- Quando houver fontes externas por pedido explicito do usuario, mencione isso brevemente no texto e deixe os links completos para as fontes relacionadas exibidas pela interface.`;
 
 function buildOpenAiPayload(messages, options = {}) {
   const enableWebSearch = options.enableWebSearch !== false && ENABLE_WEB_SEARCH;
@@ -3649,6 +3706,7 @@ function sanitizeAssistantMarkdown(text) {
   }
 
   sanitized = paragraphs.join('\n\n');
+  sanitized = sanitized.replace(/\n{0,2}##\s+(Fontes(?:\s+e\s+Confiabilidade)?|Referencias?|Referências?)\b[\s\S]*$/i, '');
   if (!sanitized.trim()) {
     sanitized = 'Nao consegui formular uma resposta final segura com base na base interna. Reformule a pergunta ou consulte o responsavel pela area.';
   }

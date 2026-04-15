@@ -1306,6 +1306,43 @@ function normalizeAssistantMarkdownForDisplay(text) {
     .replace(/(^[-*]\s[^\n]+)\n{2,}(?=[-*]\s)/gm, '$1\n');
 }
 
+function decodeMinimalHtmlEntities(text) {
+  return String(text || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, '\'')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+function sanitizeInlineHref(rawHref) {
+  var href = decodeMinimalHtmlEntities(rawHref).trim();
+  if (!href) return '';
+  if (/^www\./i.test(href)) {
+    href = 'https://' + href;
+  }
+
+  if (!/^https?:\/\//i.test(href)) {
+    return '';
+  }
+
+  try {
+    var parsed = new URL(href);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    return escapeHtml(parsed.toString());
+  } catch (error) {
+    return '';
+  }
+}
+
+function createInlineAnchorHtml(rawHref, label) {
+  var href = sanitizeInlineHref(rawHref);
+  if (!href) return label;
+  return '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>';
+}
+
 function formatInlineMarkdown(text) {
   var placeholders = [];
   var formatted = escapeHtml(text || '');
@@ -1313,6 +1350,18 @@ function formatInlineMarkdown(text) {
   formatted = formatted.replace(/`([^`\n]+)`/g, function (_, value) {
     var key = '%%INLINE_CODE_' + placeholders.length + '%%';
     placeholders.push('<code>' + value + '</code>');
+    return key;
+  });
+
+  formatted = formatted.replace(/\[([^\]\n]+)\]\(((?:https?:\/\/|www\.)[^)\s]+)\)/gi, function (_, label, href) {
+    var key = '%%INLINE_LINK_' + placeholders.length + '%%';
+    placeholders.push(createInlineAnchorHtml(href, label));
+    return key;
+  });
+
+  formatted = formatted.replace(/(^|[\s(>])((?:https?:\/\/|www\.)[^\s<]+[^\s<.,:;"')\]])/gi, function (_, prefix, href) {
+    var key = '%%INLINE_LINK_' + placeholders.length + '%%';
+    placeholders.push(prefix + createInlineAnchorHtml(href, href));
     return key;
   });
 

@@ -989,6 +989,16 @@ body.resizing-sidebar * {
   font-style: italic;
 }
 
+.ai-markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ai-markdown a:hover {
+  opacity: 0.85;
+}
+
 .ai-markdown pre {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border);
