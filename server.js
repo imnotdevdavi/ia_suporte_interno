@@ -94,7 +94,7 @@ const MAX_ATTACHMENT_FILE_SIZE = getMaxAttachmentFileBytes();
 const MAX_ATTACHMENT_FILES = getMaxAttachmentFiles();
 const MAX_ATTACHMENT_REQUEST_SIZE = getMaxAttachmentRequestBytes();
 const PROFILE_MAX_FILE_SIZE = getMaxProfilePhotoBytes();
-const ENABLE_WEB_SEARCH = String(process.env.SMARTAI_ENABLE_WEB_SEARCH || 'true').trim().toLowerCase() !== 'false';
+const ENABLE_WEB_SEARCH = String(process.env.SMARTAI_ENABLE_WEB_SEARCH || 'false').trim().toLowerCase() === 'true';
 const MAX_MODEL_OUTPUT_TOKENS = Number.parseInt(
   String(process.env.SMARTAI_MAX_OUTPUT_TOKENS || '10000').trim(),
   10
@@ -510,7 +510,11 @@ async function runSearchPass({
       async (page) => {
         const content = await getPageContent(page.id, { blockLimit, charLimit }, metrics);
         const snippets = selectRelevantSnippets(content, page.title, question);
-        const score = page.titleScore + snippets.reduce((sum, snippet) => sum + snippet.score, 0);
+        const suppressFromContext = !snippets.length
+          && shouldSuppressTitleOnlySnippet(page.title, content.sections?.[0], question);
+        const score = suppressFromContext
+          ? 0
+          : page.titleScore + snippets.reduce((sum, snippet) => sum + snippet.score, 0);
         return {
           id: page.id,
           title: page.title,
@@ -519,6 +523,7 @@ async function runSearchPass({
           sections: content.sections,
           snippets,
           score,
+          suppressFromContext,
         };
       }
     );
@@ -551,7 +556,7 @@ function hasStrongResults(results) {
 
 function rankHydratedPages(pages, resultLimit) {
   return pages
-    .filter((page) => page.content || page.snippets.length)
+    .filter((page) => !page.suppressFromContext && (page.content || page.snippets.length))
     .sort((left, right) => right.score - left.score)
     .slice(0, resultLimit);
 }
@@ -860,6 +865,7 @@ function selectRelevantSnippets(pageContent, title, question) {
 
   const titleScore = scoreTitle(title, question);
   if (!titleScore) return [];
+  if (shouldSuppressTitleOnlySnippet(title, sections[0], question)) return [];
 
   return [{
     index: 0,
@@ -930,6 +936,15 @@ function scoreSection(section, title, question) {
   else if (matches >= Math.ceil(terms.length / 2)) score += 5;
   if (section.text.length > 180) score += 1;
 
+  if ((isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question))
+    && isInternalScaffoldingText(`${title} ${section.label} ${section.text}`)) {
+    score -= 10;
+  }
+
+  if (!isInternalControlQuestion(question) && /\b(atividade de 02 dias|atividade de 2 dias|02 dias|2 dias)\b/.test(normalizedText)) {
+    score -= 12;
+  }
+
   return score;
 }
 
@@ -937,6 +952,103 @@ function buildQuestionTerms(question) {
   return [...new Set(
     tokenizeForMatch(question).filter((term) => term.length > 2 && !STOP_WORDS.has(term))
   )];
+}
+
+function normalizeIntentText(text) {
+  return normalizeForMatch(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function isGreetingOnly(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  if (normalized.split(' ').length > 4) return false;
+  return GREETING_ONLY_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isInternalControlQuestion(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  return INTERNAL_CONTROL_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isGeneralProcessQuestion(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  if (isInternalControlQuestion(normalized)) return false;
+
+  return GENERAL_PROCESS_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized))
+    || (
+      PROCESS_QUERY_TERMS.some((term) => normalized.includes(term))
+      && /\b(registro|titularidade|itbi|contrato|financiamento|imovel)\b/.test(normalized)
+    );
+}
+
+function isBoundaryProcessQuestion(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  return /\b(antes|apos|depois)\b/.test(normalized);
+}
+
+function asksForExternalSearch(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+
+  return /\b(web|internet|google|site externo|sites externos|busca externa|pesquise na web|procure na web|pesquise no google|procure no google|fora da base|fonte externa|fontes externas)\b/.test(normalized);
+}
+
+function isInternalScaffoldingText(text = '') {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return INTERNAL_SCAFFOLDING_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function shouldSuppressTitleOnlySnippet(title, section, question) {
+  if (!isGeneralProcessQuestion(question) && !isBoundaryProcessQuestion(question)) {
+    return false;
+  }
+
+  const combined = [title, section?.label, section?.text].filter(Boolean).join(' ');
+  return isInternalScaffoldingText(combined);
+}
+
+function buildQuestionSpecificGuidance(question = '') {
+  const guidance = [];
+  const normalized = normalizeIntentText(question);
+
+  if (isGeneralProcessQuestion(question)) {
+    guidance.push('- Responda em nivel de macroprocesso. Liste somente processos gerais realmente descritos na base.');
+    guidance.push('- Nao transforme subtarefas, documentos isolados, checklists, modelos de atividade, mensagens rapidas, prazos de acompanhamento ou sinonimos em processos independentes.');
+    guidance.push('- Se registro, averbacao, atualizacao de matricula ou expressoes equivalentes aparecerem como o mesmo ato registral no contexto, consolide isso em um unico processo.');
+  }
+
+  if (isBoundaryProcessQuestion(question)) {
+    guidance.push('- Se a pergunta usar "antes", "apos" ou "depois", responda apenas com processos anteriores ou posteriores ao marco citado.');
+    guidance.push('- Nao repita etapas internas do proprio processo mencionado como se viessem antes ou depois dele.');
+    guidance.push('- Quando a base trouxer alternativas condicionais como "apos ITBI", "apos contrato" e "apos registro", trate como cenarios alternativos, nunca como lista cumulativa obrigatoria.');
+  }
+
+  if (!isInternalControlQuestion(question)) {
+    guidance.push('- Nao promova prazos internos de atividade, confirmacoes, tarefas de acompanhamento ou modelos padronizados a regra geral do procedimento.');
+  }
+
+  if (/\b(financiamento|fgts|escritura)\b/.test(normalized)) {
+    guidance.push('- Nao misture requisitos de financiamento, FGTS e escritura publica. Cite apenas o que estiver sustentado pela base para o cenario perguntado.');
+  }
+
+  if (/\b(iptu|inscricao municipal)\b/.test(normalized)) {
+    guidance.push('- Quando houver lista explicita de passos na base, preserve os passos e a ordem descrita. Nao troque um passo expresso por alternativa apenas plausivel.');
+  }
+
+  if (/\b(registro|titularidade|itbi|iptu|inscricao municipal|cartorio|contrato|financiamento|matricula|imovel)\b/.test(normalized)) {
+    guidance.push('- Nao sugira acionar cartorio, Caixa, vendedor, prefeitura, cliente ou terceiros se isso nao estiver descrito explicitamente no trecho recuperado.');
+  }
+
+  if (!guidance.length) return '';
+
+  return [
+    'Instrucoes especificas para esta resposta:',
+    ...guidance,
+  ].join('\n');
 }
 
 function extractDefinitionSubjectDisplay(question) {
@@ -1326,6 +1438,65 @@ const PROCESS_QUERY_TERMS = [
   'processo',
   'roteiro',
 ];
+const GENERAL_PROCESS_QUESTION_PATTERNS = [
+  /\bquais? processos?\b/,
+  /\bo que (precisa|preciso|deve|e necessario|seria necessario)\b/,
+  /\bfinalizar (o|um)?\s*imovel\b/,
+  /\bantes\b/,
+  /\bapos\b/,
+  /\bdepois\b/,
+  /\bproximo processo\b/,
+  /\bproximas etapas\b/,
+  /\bprocessos? .*finaliza/,
+];
+const INTERNAL_CONTROL_QUESTION_PATTERNS = [
+  /\batividade\b/,
+  /\bchecklist\b/,
+  /\bcontrole interno\b/,
+  /\btarefa\b/,
+  /\bprazo interno\b/,
+  /\bmensagens? rapidas?\b/,
+  /\bmodelo da atividade\b/,
+  /\bpipe\b/,
+  /\bfunil\b/,
+  /\bcca\b/,
+];
+const INTERNAL_SCAFFOLDING_PATTERNS = [
+  /\bmensagens? rapidas?\b/,
+  /\banotacao do controle interno\b/,
+  /\bchecklist interno\b/,
+  /\bmodelo da atividade\b/,
+  /\btitulo:\b/,
+  /\bprioridade:\b/,
+  /\bstatus:\b/,
+  /\bn protocolo\b/,
+  /\bdata inicio\b/,
+  /\bdata termino\b/,
+  /\bmensagem para o cliente\b/,
+  /\bmensagem \d+\b/,
+  /\batividade de 02 dias\b/,
+  /\batividade de 2 dias\b/,
+];
+const GREETING_ONLY_PATTERNS = [
+  /^oi$/,
+  /^ola$/,
+  /^bom dia$/,
+  /^boa tarde$/,
+  /^boa noite$/,
+  /^opa$/,
+  /^e ai$/,
+  /^fala$/,
+];
+const REASONING_LEAK_PATTERNS = [
+  /^o usuario quer saber\b/i,
+  /^o usuário quer saber\b/i,
+  /^o user quer saber\b/i,
+  /^vou analisar\b/i,
+  /^preciso verificar\b/i,
+  /^devo verificar\b/i,
+  /^isso indica que\b/i,
+  /^o contexto sugere que\b/i,
+];
 
 /* ═══════════════════════════════════════════════
    EXTRAÇÃO DE ARQUIVOS
@@ -1626,6 +1797,7 @@ function buildAttachmentSearchText(extracted = []) {
 }
 
 function shouldSearchNotionForRequest(question, extracted = [], files = []) {
+  if (isGreetingOnly(question)) return false;
   if (!files.length) return true;
   if (extracted.some((file) => file.type === 'text')) return true;
 
@@ -1651,9 +1823,20 @@ function buildUserPromptText({ question, hasAttachments, hasKnowledgeBase }) {
     );
   }
 
-  sections.push(
-    'Se a base interna nao responder tudo sozinha, voce pode complementar com busca na Web, deixando explicito o que veio da base interna, o que veio da Web e qual a confiabilidade percebida das fontes externas.'
-  );
+  if (asksForExternalSearch(question)) {
+    sections.push(
+      'O usuario pediu explicitamente busca externa. Se a Web estiver disponivel, use-a apenas como complemento secundario ao Notion e deixe isso claro na resposta.'
+    );
+  } else {
+    sections.push(
+      'Use apenas os anexos e a base interna fornecida nesta conversa. Se a informacao nao estiver neles, diga isso com clareza e nao complemente com suposicoes.'
+    );
+  }
+
+  const questionSpecificGuidance = buildQuestionSpecificGuidance(question);
+  if (questionSpecificGuidance) {
+    sections.push(questionSpecificGuidance);
+  }
 
   return sections.join('\n\n');
 }
@@ -2913,32 +3096,36 @@ Se te perguntarem quem foi André Prado, responda dizendo 'Grande Amigo do Davi 
 Seu papel é esclarecer dúvidas dos colaboradores com profundidade e detalhamento. Sua função principal é ENSINAR COMO EXECUTAR, e não apenas definir conceitos. Ao responder, explique o passo a passo, ordem de execução, pré-requisitos, documentos, validações, regras internas, riscos, erros comuns e checklist final. Se o usuário pedir objetividade, seja mais direto, mas mantenha precisão e utilidade prática.
 
 REGRAS DE COMPORTAMENTO:
+- Se a mensagem do usuario for apenas uma saudacao curta, responda apenas a saudacao e se coloque a disposicao, sem puxar procedimento, Web ou indisponibilidade.
 - Quando houver arquivos anexados nesta conversa, trate-os como prioridade maxima. Analise primeiro os anexos e so depois use o Notion como contexto complementar.
 - Nao confunda arquivos anexados nesta conversa com paginas ou documentos da base do Notion.
 - Os documentos chegam como trechos extraídos do Notion. Trate cada trecho como conteúdo literal da página indicada pelo título e pela seção.
 - Se houver múltiplos trechos do mesmo documento, combine as informações antes de decidir que faltam dados.
 - A base interna do Notion é a fonte prioritária para procedimentos, regras e orientações da empresa.
-- Voce PODE consultar a Web quando a base interna nao trouxer informação suficiente, quando o contexto exigir complementação externa, ou quando houver necessidade de validar contexto geral do assunto. Use a Web como complemento, nunca para sobrepor regra interna da empresa.
-- Nunca invente, suponha ou complete lacunas sem deixar claro o que veio do Notion, o que veio da Web e o que nao foi encontrado.
+- Use somente a base interna e os anexos desta conversa, salvo se o usuario pedir explicitamente uma busca externa. Sem pedido explicito, nao use a Web.
+- Se o usuario pedir explicitamente busca externa e ela estiver disponivel, trate o material externo apenas como complemento secundario, nunca como substituto da regra interna da empresa.
+- Nunca invente, suponha ou complete lacunas com base em plausibilidade. Se nao estiver nos trechos recuperados, diga que nao encontrou na base interna.
 - Sempre que citar uma informação, identifique o nome real da página/documento do Notion (ex: "conforme a página Política de Reembolso"). Nunca use rótulos como Doc 1, Doc 2 ou similares.
 - Se o usuario perguntar sobre um arquivo anexado e ele nao puder ser lido, diga claramente que nao foi possivel analisar o anexo. Nao responda como se o arquivo tivesse sido compreendido.
+- Nunca exponha raciocinio interno, fluxo de pensamento, analise da intencao do usuario ou frases como "o usuario quer saber", "vou analisar", "preciso verificar" ou equivalentes. Entregue somente a resposta final ao colaborador.
 - Se a mensagem enviada pelo usuário possuir algum erro de digitação, termo híbrido, nome pouco usual ou combinação potencialmente ambígua, nao assuma a resposta final de primeira. Diga em 2 ou 3 bullets o que voce acha que ele pode estar querendo dizer e peça confirmação antes do passo a passo.
 - Nao se recuse a atender apenas porque a pergunta veio com erro de digitação, sigla errada, abreviação incomum ou gramática ruim. Interprete o contexto, corrija mentalmente o que for preciso e siga ajudando.
-- Se a base interna nao trouxer a informação exata, diga isso explicitamente. Se houver fontes externas úteis, apresente-as como complemento e deixe claro que sao externas.
-- Se houver divergencia entre Notion e Web, destaque a divergencia com clareza, mantenha a regra interna como prioridade para procedimento da empresa e oriente o colaborador a contatar seu tutor, lider ou o setor responsável antes de executar.
-- Se o Notion nao tiver informação suficiente, mas a Web tiver contexto útil, monte um pequeno relatório comparando o que foi encontrado internamente e externamente e finalize orientando o colaborador a contatar seu tutor/lider.
+- Se a base interna nao trouxer a informação exata, diga isso explicitamente. So mencione fontes externas quando o usuario tiver pedido busca externa.
 - Se existirem variacoes importantes de procedimento por contexto (ex: pre ou pos-arrematacao) e o usuário nao informar qual cenário se aplica, faca uma pergunta curta de esclarecimento antes do passo a passo final. Se ainda assim decidir responder, separe claramente os cenários e nunca misture fluxos distintos.
 - Quando um documento interno descrever um processo, reconstrua o fluxo completo em ordem antes de responder e confira se nenhuma etapa intermediaria ou final ficou de fora.
 - Em fluxos cartorarios, contratuais e registrais, nao pule etapas que estejam no material, mesmo que parecam administrativas, como agendamento, validacoes, videoconferencia, assinatura, protocolo, registro e pos-registro.
+- Em perguntas sobre processos, diferencie nivel de abrangencia: processo geral nao e a mesma coisa que subtarefa, checklist, documento exigido, mensagem pronta, modelo de atividade, prazo interno ou etapa operacional.
+- Nao liste subtarefas ou sinonimos como se fossem processos separados. Exemplo de consolidacao: se o contexto tratar "registro", "averbacao" e "atualizacao de matricula" como o mesmo ato registral, responda isso como um unico processo.
+- Quando a base trouxer alternativas condicionais como "apos ITBI", "apos contrato" e "apos registro", trate isso como cenarios alternativos, nunca como obrigacao cumulativa.
+- Nao transforme prazos de atividades internas, como acompanhamento ou abertura de tarefa, em prazo geral do negocio, salvo se a pergunta for explicitamente sobre controle interno.
+- Nao misture cenarios de financiamento, FGTS, escritura publica ou outros fluxos distintos. Cite apenas o que estiver sustentado pelo contexto recuperado para o cenario perguntado.
+- Nao substitua um passo explicito da base por uma alternativa apenas plausivel. Se a base mandar contratar diligente, nao troque isso por acionar outros atores sem respaldo textual.
 - Quando o usuário trouxer prints, telas, comprovantes, contratos, notas devolutivas ou outros anexos visuais, interprete o material e use isso para orientar o assessor, inclusive sugerindo como responder o cliente quando fizer sentido.
 - Responda sempre em português, com linguagem profissional e acessível.
 - Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou listas numeradas sequenciais para passos, e "**destaque**" para pontos importantes.
 - Nao use "###", "####", tabelas ou estilos incomuns.
-- Em respostas longas, priorize esta estrutura quando fizer sentido: "## Entendimento", "## Como fazer", "## Regras internas", "## Fontes e confiabilidade", "## Quando escalar".
-- Na seção de fontes e confiabilidade, deixe claro:
-  - o que veio do Notion;
-  - o que veio da Web;
-  - a confiabilidade percebida das fontes externas (alta, media ou baixa) e por quê.
+- Em respostas longas, priorize esta estrutura quando fizer sentido: "## Entendimento", "## Como fazer", "## Regras internas", "## Fontes", "## Quando escalar".
+- Na seção de fontes, deixe claro o que veio do Notion e, somente se houver pedido explicito de busca externa, o que veio da Web.
 - Quando houver fontes externas, diga explicitamente que os links completos estao listados nas fontes relacionadas da resposta.`;
 
 function buildOpenAiPayload(messages, options = {}) {
@@ -2959,6 +3146,11 @@ function buildOpenAiPayload(messages, options = {}) {
   }
 
   return payload;
+}
+
+function shouldAllowWebSearch(question, { hasAttachments = false } = {}) {
+  if (!ENABLE_WEB_SEARCH || hasAttachments) return false;
+  return asksForExternalSearch(question);
 }
 
 function getSourcesFromPages(pages) {
@@ -3313,9 +3505,25 @@ function getMessageText(content) {
 function sanitizeAssistantMarkdown(text) {
   if (!text) return '';
 
+  let sanitized = String(text)
+    .replace(/\r\n/g, '\n');
+
+  const paragraphs = sanitized
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+
+  while (paragraphs.length && REASONING_LEAK_PATTERNS.some((pattern) => pattern.test(paragraphs[0]))) {
+    paragraphs.shift();
+  }
+
+  sanitized = paragraphs.join('\n\n');
+  if (!sanitized.trim()) {
+    sanitized = 'Nao consegui formular uma resposta final segura com base na base interna. Reformule a pergunta ou consulte o responsavel pela area.';
+  }
+
   return normalizeExtractedText(
-    String(text)
-      .replace(/\r\n/g, '\n')
+    sanitized
       .replace(/^(#{4,})\s+/gm, '## ')
       .replace(/(^\d+\.\s[^\n]+)\n{2,}(?=\d+\.\s)/gm, '$1\n')
       .replace(/(^[-*]\s[^\n]+)\n{2,}(?=[-*]\s)/gm, '$1\n'),
@@ -3449,6 +3657,84 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
       .filter((f) => f.type === 'error')
       .map((f) => ({ name: f.name, reason: f.reason }));
     const readableFiles = extracted.filter(isReadableExtractedFile);
+
+    if (!files.length && isGreetingOnly(displayQuestion)) {
+      const greetingBase = displayQuestion.replace(/[!?.,;:]+$/g, '').trim() || 'Ola';
+      const greetingAnswer = `${greetingBase}! Como posso ajudar você hoje?`;
+      const totalMs = Date.now() - requestStartedAt;
+      const payload = {
+        answer: greetingAnswer,
+        requestId,
+        chatId: chat.id,
+        userMessageId: userMessage.id,
+        timings: {
+          totalMs,
+          aiMs: 0,
+          firstTokenMs: null,
+          stages: stageTimer.snapshot(),
+          notion: null,
+        },
+        sources: [],
+      };
+
+      const assistantMessage = await stageTimer.measure('saveAssistantMessage', async () => (
+        createMessage({
+          chatId: chat.id,
+          authorUserId: null,
+          role: 'assistant',
+          contentText: greetingAnswer,
+          contentFormat: 'markdown',
+          requestId,
+          modelName: null,
+          totalLatencyMs: totalMs,
+          aiLatencyMs: 0,
+          firstTokenMs: null,
+          metadata: {
+            sources: [],
+            unsupported,
+            fileIssues,
+            hasAttachments: false,
+          },
+        })
+      ));
+
+      const titledChat = await stageTimer.measure('generateChatTitle', async () => (
+        maybeUpdateGeneratedChatTitle({
+          chatId: chat.id,
+          shouldGenerateTitle,
+          question: displayQuestion,
+          answer: greetingAnswer,
+          files,
+          requestId,
+        })
+      ));
+      if (titledChat) {
+        chat = titledChat;
+        payload.chat = serializeChat(titledChat);
+      }
+
+      payload.assistantMessageId = assistantMessage.id;
+      payload.timings.stages = stageTimer.snapshot();
+
+      logStageMetrics(requestId, payload.timings.stages, null);
+      logResponseDebug({
+        requestId,
+        answer: greetingAnswer,
+        sources: [],
+        totalMs,
+        aiMs: 0,
+        firstTokenMs: null,
+        chunkCount: 0,
+      });
+
+      if (wantsStream) {
+        writeStreamEvent(res, { type: 'done', data: payload });
+        return res.end();
+      }
+
+      return res.json(payload);
+    }
+
     const shouldSearchNotion = shouldSearchNotionForRequest(question, readableFiles, files);
     const notionQuestion = shouldSearchNotion
       ? normalizeQuery(`${question} ${buildAttachmentSearchText(readableFiles)}`.slice(0, 900))
@@ -3672,7 +3958,7 @@ app.post('/api/ask', requireAuth, askRateLimiter, upload.array('files', MAX_ATTA
 
       return {
         openAiPayload: buildOpenAiPayload(nextMessages, {
-          enableWebSearch: files.length === 0,
+          enableWebSearch: shouldAllowWebSearch(question, { hasAttachments: files.length > 0 }),
         }),
       };
     });
