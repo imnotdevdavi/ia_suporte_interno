@@ -277,18 +277,18 @@ const GOOGLE_OAUTH_STATE_DURATION_MS = 1000 * 60 * 10;
 /* ═══════════════════════════════════════════════
    NOTION
 ═══════════════════════════════════════════════ */
-const NOTION_SEARCH_LIMIT = 12;
+const NOTION_SEARCH_LIMIT = 16;
 const INITIAL_RESULT_LIMIT = 5;
 const FALLBACK_RESULT_LIMIT = 8;
 const FINAL_RESULT_LIMIT = 5;
-const INITIAL_CANDIDATE_LIMIT = 12;
-const FALLBACK_CANDIDATE_LIMIT = 18;
+const INITIAL_CANDIDATE_LIMIT = 16;
+const FALLBACK_CANDIDATE_LIMIT = 24;
 const INITIAL_BLOCK_LIMIT = 260;
 const FALLBACK_BLOCK_LIMIT = 420;
 const INITIAL_PAGE_CHARS = 14000;
 const FALLBACK_PAGE_CHARS = 22000;
-const INITIAL_HYDRATION_LIMIT = 6;
-const FALLBACK_HYDRATION_LIMIT = 10;
+const INITIAL_HYDRATION_LIMIT = 10;
+const FALLBACK_HYDRATION_LIMIT = 14;
 const NOTION_HYDRATION_CONCURRENCY = 3;
 const NOTION_SEARCH_CACHE_TTL_MS = 1000 * 60 * 2;
 const NOTION_PAGE_CACHE_TTL_MS = 1000 * 60 * 15;
@@ -499,7 +499,11 @@ async function runSearchPass({
   );
   metrics.candidateCount = candidatePages.length;
 
-  const pagesToHydrate = candidatePages.slice(0, Math.min(hydrateLimit, candidatePages.length));
+  const pagesToHydrate = selectPagesToHydrate(
+    candidatePages,
+    Math.min(hydrateLimit, candidatePages.length),
+    question
+  );
   const hydrated = [];
 
   for (let offset = 0; offset < pagesToHydrate.length; offset += NOTION_HYDRATION_CONCURRENCY) {
@@ -510,11 +514,22 @@ async function runSearchPass({
       async (page) => {
         const content = await getPageContent(page.id, { blockLimit, charLimit }, metrics);
         const snippets = selectRelevantSnippets(content, page.title, question);
+        const pageArchetype = getPageArchetype({
+          title: page.title,
+          sections: content.sections,
+        });
         const suppressFromContext = !snippets.length
-          && shouldSuppressTitleOnlySnippet(page.title, content.sections?.[0], question);
+          && (
+            shouldSuppressTitleOnlySnippet(page.title, content.sections?.[0], question)
+            || (
+              (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question))
+              && pageArchetype === 'internal_scaffold'
+            )
+          );
+        const baseScore = page.titleScore + snippets.reduce((sum, snippet) => sum + snippet.score, 0);
         const score = suppressFromContext
           ? 0
-          : page.titleScore + snippets.reduce((sum, snippet) => sum + snippet.score, 0);
+          : baseScore + getPageQuestionAdjustment(pageArchetype, question);
         return {
           id: page.id,
           title: page.title,
@@ -523,6 +538,7 @@ async function runSearchPass({
           sections: content.sections,
           snippets,
           score,
+          pageArchetype,
           suppressFromContext,
         };
       }
@@ -1051,6 +1067,78 @@ function buildQuestionSpecificGuidance(question = '') {
   ].join('\n');
 }
 
+function isLikelyProcessGuideText(text = '') {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return PROCESS_GUIDE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function buildPageArchetypeText(page = {}) {
+  const parts = [page?.title || ''];
+  const sections = page?.sections || [];
+
+  sections.slice(0, 4).forEach((section) => {
+    if (section?.label) parts.push(section.label);
+    if (section?.text) parts.push(String(section.text).slice(0, 320));
+  });
+
+  return parts.filter(Boolean).join(' ');
+}
+
+function getPageArchetype(page = {}) {
+  const combined = buildPageArchetypeText(page);
+  if (!combined) return 'neutral';
+  if (isInternalScaffoldingText(combined)) return 'internal_scaffold';
+  if (isLikelyProcessGuideText(combined)) return 'process_guide';
+  return 'neutral';
+}
+
+function getPageQuestionAdjustment(pageArchetype, question = '') {
+  if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
+    if (pageArchetype === 'process_guide') return 8;
+    if (pageArchetype === 'internal_scaffold') return -8;
+  }
+
+  if (isInternalControlQuestion(question) && pageArchetype === 'internal_scaffold') {
+    return 4;
+  }
+
+  return 0;
+}
+
+function pushUniquePages(target, pages = []) {
+  const seen = new Set(target.map((page) => page.id));
+
+  pages.forEach((page) => {
+    if (!page?.id || seen.has(page.id)) return;
+    seen.add(page.id);
+    target.push(page);
+  });
+
+  return target;
+}
+
+function selectPagesToHydrate(candidatePages, hydrateLimit, question = '') {
+  if (candidatePages.length <= hydrateLimit) return candidatePages;
+
+  const selected = [];
+  const originalOrder = [...candidatePages].sort((left, right) => left.originalIndex - right.originalIndex);
+  const positiveTitleMatches = candidatePages.filter((page) => page.titleScore > 0);
+  const likelyGuidesByTitle = originalOrder.filter((page) => isLikelyProcessGuideText(page.title));
+  const titleQuota = Math.max(3, Math.ceil(hydrateLimit * 0.55));
+
+  pushUniquePages(selected, positiveTitleMatches.slice(0, titleQuota));
+
+  if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
+    pushUniquePages(selected, likelyGuidesByTitle.slice(0, Math.max(2, Math.ceil(hydrateLimit * 0.25))));
+  }
+
+  pushUniquePages(selected, originalOrder.slice(0, hydrateLimit));
+  pushUniquePages(selected, candidatePages);
+
+  return selected.slice(0, hydrateLimit);
+}
+
 function extractDefinitionSubjectDisplay(question) {
   const value = normalizeQuery(question || '');
   if (!value) return '';
@@ -1251,14 +1339,21 @@ function normalizeExtractedText(text, maxChars = Infinity) {
     .slice(0, maxChars);
 }
 
-function selectPagesForContext(pages = []) {
+function selectPagesForContext(pages = [], question = '') {
   if (!pages.length) return [];
 
-  const ranked = [...pages]
+  let ranked = [...pages]
     .filter((page) => page.content || page.snippets?.length)
     .sort((left, right) => right.score - left.score);
 
   if (!ranked.length) return [];
+
+  if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
+    const preferred = ranked.filter((page) => (page.pageArchetype || getPageArchetype(page)) !== 'internal_scaffold');
+    if (preferred.length) {
+      ranked = preferred;
+    }
+  }
 
   const topScore = ranked[0].score || 0;
   return ranked
@@ -1271,8 +1366,27 @@ function selectPagesForContext(pages = []) {
 
 function shouldExpandSequentialContext(question, page, orderedSnippets = []) {
   const normalizedQuestion = normalizeForMatch(question);
+  const pageArchetype = page?.pageArchetype || getPageArchetype(page);
+
+  if (pageArchetype === 'internal_scaffold' && !isInternalControlQuestion(question)) {
+    return false;
+  }
+
+  if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
+    if (pageArchetype !== 'process_guide') {
+      return false;
+    }
+
+    return orderedSnippets.some((snippet) => {
+      const normalizedSnippet = normalizeForMatch(`${snippet?.label || ''} ${snippet?.text || ''}`);
+      return PROCESS_QUERY_TERMS.some((term) => normalizedSnippet.includes(term))
+        || /\b(etapa|passo)\b/.test(normalizedSnippet)
+        || /(^|\s)\d+(\s|$)/.test(normalizedSnippet);
+    });
+  }
+
   if (PROCESS_QUERY_TERMS.some((term) => normalizedQuestion.includes(term))) {
-    return true;
+    return pageArchetype !== 'internal_scaffold';
   }
 
   const normalizedTitle = normalizeForMatch(page?.title || '');
@@ -1358,17 +1472,24 @@ function buildPageContextExcerpt(page, maxChars, question = '') {
 }
 
 function buildContextFromPages(pages, question = '') {
-  const selectedPages = selectPagesForContext(pages);
+  const selectedPages = selectPagesForContext(pages, question);
   if (!selectedPages.length) return null;
 
   return selectedPages
     .map((page, index) => {
       const contextLimit = index === 0 ? PRIMARY_PAGE_CONTEXT_CHARS : SECONDARY_PAGE_CONTEXT_CHARS;
       const excerpt = buildPageContextExcerpt(page, contextLimit, question);
+      const pageArchetype = page.pageArchetype || getPageArchetype(page);
       const lines = [
         `Documento: ${page.title}`,
         `URL: ${page.url}`,
       ];
+
+      if (pageArchetype === 'process_guide') {
+        lines.push('Perfil do documento: guia de processo ou procedimento.');
+      } else if (pageArchetype === 'internal_scaffold') {
+        lines.push('Perfil do documento: material interno operacional/checklist/modelo. Nao tratar isso como macroprocesso, salvo se a pergunta for explicitamente sobre controle interno.');
+      }
 
       const centralSections = [...new Set(
         (page.snippets || [])
@@ -1437,6 +1558,16 @@ const PROCESS_QUERY_TERMS = [
   'procedimento',
   'processo',
   'roteiro',
+];
+const PROCESS_GUIDE_PATTERNS = [
+  /\bpasso a passo\b/,
+  /\bcomo (fazer|funciona|emitir|solicitar|realizar|proceder|dar entrada)\b/,
+  /\b(etapas?|fluxo|procedimento|processo|roteiro)\b/,
+  /\bdocumenta(c|ç)ao necessaria\b/,
+  /\bdocumentos necessarios\b/,
+  /\bo que e\b/,
+  /\bo que é\b/,
+  /\bquando (usar|fazer|aplicar)\b/,
 ];
 const GENERAL_PROCESS_QUESTION_PATTERNS = [
   /\bquais? processos?\b/,
