@@ -591,9 +591,31 @@ function mergeCandidates(primary, fallback, resultLimit = FINAL_RESULT_LIMIT) {
     .slice(0, resultLimit);
 }
 
+function buildScenarioQueries(question) {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return [];
+
+  const hints = [];
+
+  if (isRemainingWorkQuestion(question)) {
+    if (/\bregistro\b/.test(normalized) || /\bregistrad[oa]\b/.test(normalized)) {
+      hints.push('apos registro', 'pos registro regularizacao');
+    }
+    if (/\btitularidade\b/.test(normalized)) {
+      hints.push('apos titularidade', 'troca titularidade depois');
+    }
+    if (/\bitbi\b/.test(normalized)) {
+      hints.push('apos itbi', 'depois do itbi');
+    }
+  }
+
+  return [...new Set(hints.map((hint) => expandQueryWithAliases(hint).slice(0, 240)).filter(Boolean))];
+}
+
 function buildRelatedQueriesFromQuestion(question) {
   const terms = buildQuestionTerms(question);
-  if (!terms.length) return [];
+  const scenarioHints = buildScenarioQueries(question);
+  if (!terms.length) return scenarioHints;
 
   const hints = [];
   terms.forEach((term) => {
@@ -601,11 +623,15 @@ function buildRelatedQueriesFromQuestion(question) {
     related.forEach((hint) => hints.push(hint));
   });
 
-  const capped = (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question))
-    ? hints.slice(0, 6)
-    : hints.slice(0, 3);
+  const genericLimit = (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question))
+    ? 6
+    : 3;
+  const capped = hints.slice(0, genericLimit);
 
-  return [...new Set(capped.map((hint) => expandQueryWithAliases(hint).slice(0, 240)).filter(Boolean))];
+  return [...new Set([
+    ...scenarioHints,
+    ...capped.map((hint) => expandQueryWithAliases(hint).slice(0, 240)).filter(Boolean),
+  ])];
 }
 
 function buildPrimaryQueries(question) {
@@ -933,8 +959,10 @@ function scoreSection(section, title, question) {
   if (!terms.length) return 0;
 
   const normalizedQuestion = normalizeForMatch(question);
+  const normalizedTitle = normalizeForMatch(title);
   const normalizedText = normalizeForMatch(section.text);
   const normalizedLabel = normalizeForMatch(section.label);
+  const combinedNormalized = `${normalizedTitle} ${normalizedLabel} ${normalizedText}`.trim();
   const titleTokens = new Set(tokenizeForMatch(title));
   const labelTokens = new Set(tokenizeForMatch(section.label));
   const contentTokens = new Set(tokenizeForMatch(section.text));
@@ -979,6 +1007,24 @@ function scoreSection(section, title, question) {
     score -= 12;
   }
 
+  if (!asksForPeopleOwnership(question)
+    && (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question) || isRemainingWorkQuestion(question))
+    && /\b(responsavel|responsaveis|assessor|assessores)\b/.test(combinedNormalized)) {
+    score -= 8;
+  }
+
+  if (isRemainingWorkQuestion(question)
+    && /\b(registro|titularidade|regularizacao|matricula)\b/.test(normalizedQuestion)
+    && /\b(pre arrematacao|due diligence)\b/.test(combinedNormalized)) {
+    score -= 14;
+  }
+
+  if (isRemainingWorkQuestion(question)
+    && /\b(registro|titularidade|regularizacao|matricula)\b/.test(normalizedQuestion)
+    && /\b(onr|visualizacao de matricula)\b/.test(combinedNormalized)) {
+    score -= 10;
+  }
+
   return score;
 }
 
@@ -1009,6 +1055,7 @@ function isGeneralProcessQuestion(question = '') {
   const normalized = normalizeIntentText(question);
   if (!normalized) return false;
   if (isInternalControlQuestion(normalized)) return false;
+  if (isRemainingWorkQuestion(question)) return true;
 
   return GENERAL_PROCESS_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized))
     || (
@@ -1017,10 +1064,51 @@ function isGeneralProcessQuestion(question = '') {
     );
 }
 
+function isRemainingWorkQuestion(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  return REMAINING_WORK_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function asksForPeopleOwnership(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  return /\b(quem|responsavel|responsaveis)\b/.test(normalized);
+}
+
+function isConditionDrivenQuestion(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return false;
+  return CONDITION_RULE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function extractCompletionStateWindow(question = '') {
+  const normalized = normalizeIntentText(question);
+  if (!normalized) return '';
+
+  const stopPattern = /\b(o que falta|o que ainda falta|o que resta|resta|ainda precisa|para finalizar|para concluir|proximo passo|proxima etapa)\b/;
+  const match = normalized.match(stopPattern);
+  const window = match ? normalized.slice(0, match.index) : normalized;
+  return window.slice(0, 220).trim();
+}
+
+function extractCompletedScenarioItems(question = '') {
+  const stateWindow = extractCompletionStateWindow(question);
+  if (!stateWindow || !COMPLETION_WINDOW_CUE_PATTERN.test(stateWindow)) {
+    return [];
+  }
+
+  return PROCESS_STATE_HINTS
+    .filter((item) => item.patterns.some((pattern) => pattern.test(stateWindow)))
+    .map((item) => item.label);
+}
+
 function isBoundaryProcessQuestion(question = '') {
   const normalized = normalizeIntentText(question);
   if (!normalized) return false;
-  return /\b(antes|apos|depois)\b/.test(normalized);
+  if (!/\b(antes|apos|depois)\b/.test(normalized)) return false;
+  if (/\b(antes|apos|depois)\s+de\s+(?:19|20)\d{2}\b/.test(normalized)) return false;
+  return PROCESS_BOUNDARY_REFERENCE_TERMS.some((term) => normalized.includes(term));
 }
 
 function asksForExternalSearch(question = '') {
@@ -1048,18 +1136,34 @@ function shouldSuppressTitleOnlySnippet(title, section, question) {
 function buildQuestionSpecificGuidance(question = '') {
   const guidance = [];
   const normalized = normalizeIntentText(question);
+  const completedItems = extractCompletedScenarioItems(question);
 
   if (isGeneralProcessQuestion(question)) {
-    guidance.push('- Responda em nivel de macroprocesso. Liste somente processos gerais realmente descritos na base.');
+    guidance.push('- Responda no nivel pedido pelo usuario. Se ele perguntou por processos gerais, liste apenas processos gerais sustentados pela base.');
+    guidance.push('- Nao rebatize automaticamente tarefa, atividade, checklist, documento ou responsavel como "macroprocesso". Use processo, etapa, atividade ou documento conforme o material sustentar.');
     guidance.push('- Nao transforme subtarefas, documentos isolados, checklists, modelos de atividade, mensagens rapidas, prazos de acompanhamento ou sinonimos em processos independentes.');
     guidance.push('- Se registro, averbacao, atualizacao de matricula ou expressoes equivalentes aparecerem como o mesmo ato registral no contexto, consolide isso em um unico processo.');
     guidance.push('- Se o mesmo procedimento mencionar planilha, formulario, sistema, canal, versao, via alternativa, fornecedor ou documento operacional relevante, apresente isso ja na primeira resposta, sem esperar uma pergunta de aprofundamento.');
+  }
+
+  if (isRemainingWorkQuestion(question)) {
+    guidance.push('- Se a pergunta for sobre o que falta, o que resta, a proxima etapa ou como finalizar, responda somente com o que ainda esta pendente para concluir o caso.');
+    guidance.push('- Trate como concluidas as etapas que o usuario descreveu como ja feitas e nao as repita como pendencias.');
+    if (completedItems.length) {
+      guidance.push(`- Etapas descritas pelo usuario como ja concluidas neste caso: ${completedItems.join(' | ')}.`);
+    }
+    guidance.push('- Nao puxe due diligence, pre-arrematacao, checagens iniciais ou fluxos paralelos quando o usuario estiver pedindo apenas a pendencia remanescente.');
   }
 
   if (isBoundaryProcessQuestion(question)) {
     guidance.push('- Se a pergunta usar "antes", "apos" ou "depois", responda apenas com processos anteriores ou posteriores ao marco citado.');
     guidance.push('- Nao repita etapas internas do proprio processo mencionado como se viessem antes ou depois dele.');
     guidance.push('- Quando a base trouxer alternativas condicionais como "apos ITBI", "apos contrato" e "apos registro", trate como cenarios alternativos, nunca como lista cumulativa obrigatoria.');
+  }
+
+  if (isConditionDrivenQuestion(question)) {
+    guidance.push('- A situacao descrita pelo usuario e parte central da resposta. Analise primeiro a condicao, excecao, ano, vencimento ou pendencia mencionada antes de listar qualquer fluxo.');
+    guidance.push('- Se a pergunta estiver focada na situacao narrada, responda a regra aplicavel e seus desdobramentos. Nao substitua isso por um passo a passo generico do processo.');
   }
 
   if (!isInternalControlQuestion(question)) {
@@ -1080,6 +1184,14 @@ function buildQuestionSpecificGuidance(question = '') {
 
   if (/\b(registro|titularidade|itbi|iptu|inscricao municipal|cartorio|contrato|financiamento|matricula|imovel)\b/.test(normalized)) {
     guidance.push('- Nao sugira acionar cartorio, Caixa, vendedor, prefeitura, cliente ou terceiros se isso nao estiver descrito explicitamente no trecho recuperado.');
+  }
+
+  if (!asksForPeopleOwnership(question)) {
+    guidance.push('- Nao liste nomes proprios, assessores especificos, ex-funcionarios ou "responsaveis por etapa" como parte da resposta, salvo se o usuario perguntar explicitamente quem.');
+  }
+
+  if (/\b(registro|titularidade|matricula|cartorio)\b/.test(normalized)) {
+    guidance.push('- Nao sugira visualizacao de matricula pela ONR como passo padrao. So mencione ONR se o trecho recuperado trouxer isso expressamente como excecao ou ultima instancia.');
   }
 
   if (!guidance.length) return '';
@@ -1395,6 +1507,10 @@ function shouldExpandSequentialContext(question, page, orderedSnippets = []) {
     return false;
   }
 
+  if (isConditionDrivenQuestion(question) && !isGeneralProcessQuestion(question) && !isBoundaryProcessQuestion(question)) {
+    return false;
+  }
+
   if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
     if (pageArchetype !== 'process_guide') {
       return false;
@@ -1429,6 +1545,9 @@ function shouldStartContextFromTop(question, page, orderedSnippets = []) {
   const pageArchetype = page?.pageArchetype || getPageArchetype(page);
 
   if (pageArchetype !== 'process_guide') return false;
+  if (isConditionDrivenQuestion(question) && !isGeneralProcessQuestion(question) && !isBoundaryProcessQuestion(question)) {
+    return false;
+  }
 
   if (isGeneralProcessQuestion(question) || isBoundaryProcessQuestion(question)) {
     return true;
@@ -1588,12 +1707,17 @@ const KNOWN_BUSINESS_TERMS = new Set([
   'pre',
   'pos',
   'matricula',
+  'averbacao',
   'nota',
   'devolutiva',
   'rerratificacao',
   'contrato',
   'parceiro',
   'planilha',
+  'regularizacao',
+  'debito',
+  'pendencia',
+  'onr',
 ]);
 const RELATED_QUERY_HINTS_MAP = new Map([
   ['diligencia', ['planilha diligencias', 'correspondente dinamico', 'contratacao diligencia']],
@@ -1605,6 +1729,7 @@ const RELATED_QUERY_HINTS_MAP = new Map([
   ['fgts', ['contrato financiamento fgts', 'registro financiamento']],
   ['iptu', ['inscricao municipal prefeitura iptu', 'diligencia iptu']],
   ['matricula', ['registro matricula atualizada', 'inscricao municipal iptu']],
+  ['regularizacao', ['regularizacao registro titularidade', 'pendencia regularizacao']],
 ]);
 const PROCESS_QUERY_TERMS = [
   'como',
@@ -1629,12 +1754,86 @@ const GENERAL_PROCESS_QUESTION_PATTERNS = [
   /\bquais? processos?\b/,
   /\bo que (precisa|preciso|deve|e necessario|seria necessario)\b/,
   /\bfinalizar (o|um)?\s*imovel\b/,
-  /\bantes\b/,
-  /\bapos\b/,
-  /\bdepois\b/,
+  /\bo que falta\b/,
+  /\bo que ainda falta\b/,
+  /\bo que resta\b/,
+  /\bainda precisa\b/,
+  /\bpara finalizar\b/,
+  /\bpara concluir\b/,
   /\bproximo processo\b/,
+  /\bproximo passo\b/,
+  /\bproxima etapa\b/,
   /\bproximas etapas\b/,
   /\bprocessos? .*finaliza/,
+];
+const REMAINING_WORK_PATTERNS = [
+  /\bo que falta\b/,
+  /\bo que ainda falta\b/,
+  /\bo que resta\b/,
+  /\bresta\b/,
+  /\bainda precisa\b/,
+  /\bainda e necessario\b/,
+  /\bpara finalizar\b/,
+  /\bpara concluir\b/,
+  /\bpendencia remanescente\b/,
+  /\bpendencias remanescentes\b/,
+  /\bproximo passo\b/,
+  /\bproxima etapa\b/,
+];
+const PROCESS_BOUNDARY_REFERENCE_TERMS = [
+  'registro',
+  'averbacao',
+  'matricula',
+  'itbi',
+  'contrato',
+  'financiamento',
+  'assinatura',
+  'escritura',
+  'titularidade',
+  'arrematacao',
+  'pagamento',
+  'quitacao',
+];
+const CONDITION_RULE_PATTERNS = [
+  /\bprescri/,
+  /\bvencid/,
+  /\bdebito\b/,
+  /\bdebitos\b/,
+  /\bdivida\b/,
+  /\bdividas\b/,
+  /\bpendenc/,
+  /\bsituac/,
+  /\bcenario\b/,
+  /\bcaso\b/,
+  /\bhipotese\b/,
+  /\b(?:19|20)\d{2}\b/,
+];
+const COMPLETION_WINDOW_CUE_PATTERN = /\b(ja|est[aá]|tem|possui|feito|feita|realizad|concluid|salv|emitid|pago|quitad|registrad|averbad|assinad)\b/;
+const PROCESS_STATE_HINTS = [
+  {
+    label: 'registro/ato registral',
+    patterns: [/\bregistro\b/, /\bregistrad[oa]\b/, /\baverbacao\b/, /\bmatricula atualizada\b/],
+  },
+  {
+    label: 'troca de titularidade',
+    patterns: [/\btitularidade\b/, /\btroca de titularidade\b/],
+  },
+  {
+    label: 'ITBI',
+    patterns: [/\bitbi\b/],
+  },
+  {
+    label: 'contrato',
+    patterns: [/\bcontrato\b/, /\bassinad[oa]\b/],
+  },
+  {
+    label: 'financiamento/FGTS',
+    patterns: [/\bfinanciamento\b/, /\bfgts\b/],
+  },
+  {
+    label: 'inscricao municipal/IPTU',
+    patterns: [/\binscricao municipal\b/, /\biptu\b/],
+  },
 ];
 const INTERNAL_CONTROL_QUESTION_PATTERNS = [
   /\batividade\b/,
@@ -3303,11 +3502,16 @@ REGRAS DE COMPORTAMENTO:
 - Em respostas procedimentais, pense em um colaborador novo: consolide o fluxo completo de primeira, incluindo ferramentas, planilhas, formularios, sistemas, vias alternativas, documentos e excecoes relevantes que aparecam no mesmo material.
 - Em fluxos cartorarios, contratuais e registrais, nao pule etapas que estejam no material, mesmo que parecam administrativas, como agendamento, validacoes, videoconferencia, assinatura, protocolo, registro e pos-registro.
 - Em perguntas sobre processos, diferencie nivel de abrangencia: processo geral nao e a mesma coisa que subtarefa, checklist, documento exigido, mensagem pronta, modelo de atividade, prazo interno ou etapa operacional.
+- Nao rebatize automaticamente toda tarefa, atividade, checklist ou documento como "macroprocesso". Use processo, etapa, atividade ou documento conforme o material sustentar.
 - Nao liste subtarefas ou sinonimos como se fossem processos separados. Exemplo de consolidacao: se o contexto tratar "registro", "averbacao" e "atualizacao de matricula" como o mesmo ato registral, responda isso como um unico processo.
+- Se o usuario disser que uma etapa ja foi feita ou que o caso ja esta em determinado estado, trate isso como concluido no cenario narrado e responda somente com o que ainda falta.
 - Quando a base trouxer alternativas condicionais como "apos ITBI", "apos contrato" e "apos registro", trate isso como cenarios alternativos, nunca como obrigacao cumulativa.
 - Nao transforme prazos de atividades internas, como acompanhamento ou abertura de tarefa, em prazo geral do negocio, salvo se a pergunta for explicitamente sobre controle interno.
 - Nao misture cenarios de financiamento, FGTS, escritura publica ou outros fluxos distintos. Cite apenas o que estiver sustentado pelo contexto recuperado para o cenario perguntado.
+- Quando a pergunta descrever uma situacao especifica, como etapa ja concluida, pendencia remanescente, excecao, vencimento ou outro estado do caso, responda essa situacao antes de listar qualquer fluxo generico.
 - Nao substitua um passo explicito da base por uma alternativa apenas plausivel. Se a base mandar contratar diligente, nao troque isso por acionar outros atores sem respaldo textual.
+- Nao liste nomes proprios, assessores especificos, ex-funcionarios ou "responsaveis por etapa" como parte da resposta, salvo se o usuario perguntar explicitamente quem.
+- Nao sugira visualizacao de matricula pela ONR como passo padrao sem respaldo textual expresso e contexto de excecao.
 - Quando o usuário trouxer prints, telas, comprovantes, contratos, notas devolutivas ou outros anexos visuais, interprete o material e use isso para orientar o assessor, inclusive sugerindo como responder o cliente quando fizer sentido.
 - Responda sempre em português, com linguagem profissional e acessível.
 - Use markdown simples e consistente: use apenas "## Titulo" para seções principais, "-" ou listas numeradas sequenciais para passos, e "**destaque**" para pontos importantes.
